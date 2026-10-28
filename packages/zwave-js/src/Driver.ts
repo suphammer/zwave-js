@@ -18,6 +18,10 @@ export {
 	isMessageWithCC,
 } from "@zwave-js/serial/serialapi";
 export { Driver, libName, libVersion } from "./lib/driver/Driver.js";
+export type {
+	ControllerOptions,
+	SuphacapControllerOptions,
+} from "./lib/driver/ControllerOptions.js";
 export * from "./lib/driver/DriverMode.js";
 export type {
 	EditableZWaveOptions,

@@ -34,6 +34,7 @@
   - [Send custom messages](usage/custom.md)
   - [External config DB location](usage/external-config.md)
   - [Remote serial port over TCP](usage/tcp-connection.md)
+  - [Suphacap firmware-MAC controller](usage/suphacap.md)
   - [Custom log transports](usage/log-transports.md)
 
 - Troubleshooting

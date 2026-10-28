@@ -15,7 +15,12 @@ import type {
 	JoinNetworkUserCallbacks,
 } from "../controller/Inclusion.js";
 
+import type { ControllerOptions } from "./ControllerOptions.js";
+
 export interface ZWaveOptions {
+	/** Select the controller implementation. Defaults to the standard Serial API. */
+	controller?: ControllerOptions;
+
 	/** Specify timeouts in milliseconds */
 	timeouts: {
 		/** how long to wait for an ACK */

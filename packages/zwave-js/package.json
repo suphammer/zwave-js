@@ -84,6 +84,13 @@
       "require": "./build/cjs/lib/driver/mDNSDiscovery/node.js",
       "node": "./build/esm/lib/driver/mDNSDiscovery/node.js",
       "default": "./build/esm/lib/driver/mDNSDiscovery/stub.js"
+    },
+    "#controller/suphacap": {
+      "browser": "./build/esm/lib/suphacap/DriverBackend.stub.js",
+      "@@dev": "./src/lib/suphacap/DriverBackend.ts",
+      "require": "./build/cjs/lib/suphacap/DriverBackend.js",
+      "node": "./build/esm/lib/suphacap/DriverBackend.js",
+      "default": "./build/esm/lib/suphacap/DriverBackend.stub.js"
     }
   },
   "files": [

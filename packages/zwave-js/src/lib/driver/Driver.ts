@@ -257,6 +257,7 @@ import {
 } from "../telemetry/statistics.js";
 
 import { Bootloader } from "./Bootloader.js";
+import { validateControllerOptions } from "./ControllerOptions.js";
 import { DriverMode } from "./DriverMode.js";
 import { EndDeviceCLI } from "./EndDeviceCLI.js";
 import {
@@ -396,6 +397,21 @@ const defaultOptions: ZWaveOptions = {
 
 /** Ensures that the options are valid */
 function checkOptions(options: ZWaveOptions): void {
+	validateControllerOptions(options.controller);
+	if (options.controller?.type === "suphacap") {
+		for (const feature of [
+			"softReset",
+			"unresponsiveControllerRecovery",
+			"watchdog",
+		] as const) {
+			if (options.features[feature]) {
+				throw new ZWaveError(
+					`The Suphacap controller backend does not support features.${feature}`,
+					ZWaveErrorCodes.Driver_InvalidOptions,
+				);
+			}
+		}
+	}
 	if (options.timeouts.ack < 1) {
 		throw new ZWaveError(
 			`The ACK timeout must be positive!`,
@@ -874,10 +890,13 @@ export class Driver
 			mergedOptions = mergeDeep(mergedOptions, preset, true);
 		}
 		// Finally apply the defaults, without overwriting any existing settings
-		this._options = mergeDeep(
-			mergedOptions,
-			cloneDeep(defaultOptions),
-		) as ZWaveOptions;
+		const defaults = cloneDeep(defaultOptions);
+		if (mergedOptions.controller?.type === "suphacap") {
+			defaults.features.softReset = false;
+			defaults.features.unresponsiveControllerRecovery = false;
+			defaults.features.watchdog = false;
+		}
+		this._options = mergeDeep(mergedOptions, defaults) as ZWaveOptions;
 
 		// And make sure they contain valid values
 		checkOptions(this._options);
@@ -1675,7 +1694,50 @@ export class Driver
 
 		// Open the serial port
 		let binding: ZWaveSerialBindingFactory;
-		if (typeof this.port === "string") {
+		if (this._options.controller?.type === "suphacap") {
+			this.nativeControllerBackend = import("#controller/suphacap").then(
+				({ createSuphacapDriverBackend }) =>
+					createSuphacapDriverBackend({
+						port: this.port,
+						controller: this._options.controller as Extract<
+							NonNullable<ZWaveOptions["controller"]>,
+							{ type: "suphacap" }
+						>,
+						region: this._options.rf?.region ?? RFRegion.Europe,
+						cacheDir: this.cacheDir,
+						databaseOptions: this.getJsonlDBOptions(),
+						logConfig: this._options.logConfig,
+						host: this.bindings,
+						onDiagnostic: (message) => {
+							if (!this.wasDestroyed) {
+								this.driverLog.print(message, "verbose");
+							}
+						},
+						onError: (error) => {
+							if (this.wasDestroyed) return;
+							const message = `Suphacap controller error: ${getErrorMessage(error)}`;
+							void this.destroyWithMessage(message).catch(() => {
+								// Explicit destroy() callers can observe cleanup failures.
+							});
+						},
+					}),
+			);
+			try {
+				const backend = await this.nativeControllerBackend;
+				if (this._destroyPromise) {
+					await backend.destroy();
+					throw new ZWaveError(
+						"The driver was destroyed",
+						ZWaveErrorCodes.Driver_Destroyed,
+					);
+				}
+				this._controllerBackendCapabilities = backend.capabilities;
+				binding = backend.binding;
+			} catch (error) {
+				await this.destroy();
+				throw error;
+			}
+		} else if (typeof this.port === "string") {
 			if (
 				typeof this.bindings.serial.createFactoryByPath === "function"
 			) {

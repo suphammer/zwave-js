@@ -375,6 +375,11 @@ export { ControllerLogContext }
 
 export { ControllerNodeLogContext }
 
+// @public
+export type ControllerOptions = {
+    type: "serial-api";
+} | SuphacapControllerOptions;
+
 // Warning: (ae-missing-release-tag) "ControllerProprietary" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -2195,6 +2200,16 @@ export enum SetUserResult {
 // @public (undocumented)
 export type SmartStartProvisioningEntry = PlannedProvisioningEntry | IncludedProvisioningEntry;
 
+// @public
+export interface SuphacapControllerOptions {
+    homeId?: number;
+    inclusionChannel?: number;
+    ownNodeId?: number;
+    transmitChannel?: number;
+    // (undocumented)
+    type: "suphacap";
+}
+
 export { Switchpoint }
 
 export { TranslatedValueID }
@@ -3308,6 +3323,7 @@ export interface ZWaveOptions {
         partialReports: number;
     };
     bootloaderMode?: "recover" | "allow" | "stay";
+    controller?: ControllerOptions;
     disableOptimisticValueUpdate?: boolean;
     emitValueUpdateAfterSetValue?: boolean;
     // (undocumented)
