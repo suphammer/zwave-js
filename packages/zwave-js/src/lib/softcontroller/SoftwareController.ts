@@ -46,6 +46,7 @@ import {
 	isNodeInformationFrameForController,
 	parseOverAirNodeInformationFrame,
 } from "./NodeInformation.js";
+import { NodeInformationRequest } from "./NodeInformationRequest.js";
 import { findRoutes, MAX_RETURN_ROUTES } from "./RouteManager.js";
 import type {
 	SoftwareControllerRadio,
@@ -506,7 +507,8 @@ export class SoftwareController implements RawControllerTransport {
 	#explorerResultWaiter: ExplorerResultWaiter | undefined;
 	#sequenceNumber: number | undefined;
 	#sendInFlight = false;
-	#activeSend: Promise<ControllerTransmitResult> | undefined;
+	#activeSend: Promise<unknown> | undefined;
+	#nodeInformationRequest: NodeInformationRequest | undefined;
 	#persistenceTail: Promise<void> = Promise.resolve();
 	#persistenceError: { error: unknown } | undefined;
 	#stopOperation: Promise<void> | undefined;
@@ -595,6 +597,7 @@ export class SoftwareController implements RawControllerTransport {
 	}
 
 	async #performFactoryDefault(): Promise<ControllerIdentity> {
+		this.#nodeInformationRequest?.cancel();
 		await this.#cancelNetworkManagementForFactoryDefault();
 		await this.#activeSend?.catch((error) => this.#reportError(error));
 		if (this.#networkManagementSession || this.#sendInFlight) {
@@ -1085,6 +1088,7 @@ export class SoftwareController implements RawControllerTransport {
 		} else if (this.#networkManagementSession?.kind === "exclusion") {
 			await this.#stopExclusion().catch(collectError);
 		}
+		this.#nodeInformationRequest?.cancel();
 		this.#started = false;
 		const radio = this.#radio;
 		try {
@@ -1119,6 +1123,82 @@ export class SoftwareController implements RawControllerTransport {
 				"Software controller could not be stopped safely",
 			);
 		}
+	}
+
+	public async requestNodeInformation(
+		nodeId: number,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<ControllerApplicationFrame | undefined> {
+		if (
+			!this.#started
+			|| !this.#regionConfig
+			|| this.#faulted
+			|| this.#sendInFlight
+			|| this.#networkManagementSession
+			|| this.#factoryDefaultOperation
+			|| !this.#includedNodeIds.has(nodeId)
+			|| nodeId === this.#normalized.ownNodeId
+			|| signal?.aborted
+		)
+			return;
+		const pending = new NodeInformationRequest(nodeId, timeoutMs, signal);
+		this.#nodeInformationRequest = pending;
+		this.#sendInFlight = true;
+		const operation = this.#requestNodeInformation(pending);
+		this.#activeSend = operation;
+		try {
+			return await operation;
+		} finally {
+			this.#sendInFlight = false;
+			if (this.#activeSend === operation) this.#activeSend = undefined;
+		}
+	}
+
+	async #requestNodeInformation(
+		pending: NodeInformationRequest,
+	): Promise<ControllerApplicationFrame | undefined> {
+		let frame: ControllerApplicationFrame | undefined;
+		let failure: { error: unknown } | undefined;
+		try {
+			const result = await this.#sendAcrossClassicChannels(
+				{
+					destinationNodeId: pending.nodeId,
+					command: Uint8Array.of(0x01, 0x02),
+					transmitOptions: 0,
+				},
+				true,
+			);
+			if (result.status === ControllerTransmitStatus.OK)
+				frame = await pending.response;
+		} catch (error) {
+			failure = { error };
+		}
+		pending.cancel();
+		try {
+			// A response must not reach the Driver until hopping is restored
+			// and the operation fence can release its next interview command.
+			await this.#configure(
+				this.#radio,
+				!this.#started || this.#faulted || this.#factoryDefaultOperation
+					? "disabled"
+					: "network",
+			);
+		} catch (error) {
+			this.#handleRadioError(error);
+			if (failure) {
+				throw new AggregateError(
+					[...new Set([failure.error, error])],
+					"Node information request and receiver cleanup failed",
+				);
+			}
+			throw error;
+		} finally {
+			if (this.#nodeInformationRequest === pending)
+				this.#nodeInformationRequest = undefined;
+		}
+		if (failure) throw failure.error;
+		return frame;
 	}
 
 	public async send(
@@ -1162,6 +1242,7 @@ export class SoftwareController implements RawControllerTransport {
 
 	async #sendAcrossClassicChannels(
 		request: ControllerTransmitRequest,
+		holdRx = false,
 	): Promise<ControllerTransmitResult> {
 		const flirsBeamMode = beamModeFromProtocolInfo(
 			this.#nodeProtocolInfo.get(request.destinationNodeId),
@@ -1220,7 +1301,7 @@ export class SoftwareController implements RawControllerTransport {
 			request,
 			initialChannel,
 			this.#normalized.homeId,
-			false,
+			holdRx,
 			false,
 			selectedRoute ?? (beamMode ? null : undefined),
 			beamMode ?? null,
@@ -3233,15 +3314,18 @@ export class SoftwareController implements RawControllerTransport {
 			return;
 		}
 
-		this.#onFrame({
+		const frame: ControllerApplicationFrame = {
 			sourceNodeId: mpdu.sourceNodeId,
 			command: mpdu.payload,
 			frameType,
 			isExploreFrame: mpdu instanceof ExplorerZWaveMPDU,
-		});
+		};
+		if (this.#nodeInformationRequest?.accept(frame)) return;
+		this.#onFrame(frame);
 	};
 
 	readonly #handleRadioError = (error: unknown): void => {
+		this.#nodeInformationRequest?.cancel();
 		this.#faulted = true;
 		this.#reportError(error);
 	};

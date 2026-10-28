@@ -24,6 +24,15 @@ emulate these across USB through host timers. The software controller owns
 the longer inclusion and replication sequences, using the radio's completed
 MAC transactions.
 
+Request Node Information waits up to five seconds on the selected transmit
+channel. The radio holds RX there as part of the
+transmit operation, so an immediate 9.6 kbit/s NIF cannot be lost to a retune.
+The software controller restores normal reception before returning the
+observed NIF to the Driver. Timeout, cancellation, reset, shutdown, and radio
+errors trigger the same receiver cleanup; shutdown and fault cleanup disable MAC
+instead of re-enabling normal traffic. Ordinary `send` results still report
+transmit completion, independently of a later application response.
+
 Capabilities describe implemented contracts. They do not follow from a
 manufacturer name, a guessed SDK version, or a successfully queued command.
 Unsupported SmartStart, Network Wide Inclusion, high-power overrides, and

@@ -156,6 +156,12 @@ export interface RawControllerTransport {
 	): Promise<void> | void;
 	stop?(): Promise<void> | void;
 	send(request: ControllerTransmitRequest): Promise<ControllerTransmitResult>;
+	/** Resolves with a real NIF only after the bounded receive window is restored. */
+	requestNodeInformation?(
+		nodeId: number,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<ControllerApplicationFrame | undefined>;
 	/**
 	 * Omit unless the backend can cancel or fence the active RF operation. Once
 	 * resolved, a late completion must not be confused with a later send.
@@ -291,6 +297,7 @@ type NetworkManagementSession = InclusionSession | ExclusionSession;
 
 interface PendingNodeInfoRequest {
 	nodeId: number;
+	abort: AbortController | undefined;
 	timeout: ReturnType<typeof setTimeout>;
 }
 
@@ -508,6 +515,7 @@ class ControllerBindingRuntime {
 		for (const pending of this.#pendingTransmits) pending.aborted = true;
 		this.#pendingTransmits.clear();
 		if (this.#pendingNodeInfoRequest) {
+			this.#pendingNodeInfoRequest.abort?.abort();
 			clearTimeout(this.#pendingNodeInfoRequest.timeout);
 			this.#pendingNodeInfoRequest = undefined;
 		}
@@ -1132,17 +1140,53 @@ class ControllerBindingRuntime {
 			return;
 		}
 
+		const requestNodeInformation =
+			this.#options.transport.requestNodeInformation?.bind(
+				this.#options.transport,
+			);
+		const abort = requestNodeInformation
+			? new AbortController()
+			: undefined;
+
 		let pending!: PendingNodeInfoRequest;
 		const timeout = setTimeout(() => {
-			this.#failNodeInfoRequest(pending);
+			if (abort) abort.abort();
+			else this.#failNodeInfoRequest(pending);
 		}, REQUEST_NODE_INFO_TIMEOUT_MS);
 		timeout.unref();
-		pending = { nodeId, timeout };
+		pending = { nodeId, timeout, abort };
 		this.#pendingNodeInfoRequest = pending;
 		this.#queueResponse(
 			SerialApiFunction.RequestNodeInfo,
 			Uint8Array.of(1),
 		);
+
+		if (requestNodeInformation) {
+			void Promise.resolve()
+				.then(() =>
+					requestNodeInformation(
+						nodeId,
+						REQUEST_NODE_INFO_TIMEOUT_MS,
+						abort!.signal,
+					),
+				)
+				.then(
+					(frame) => {
+						if (
+							this.#closed
+							|| this.#pendingNodeInfoRequest !== pending
+						)
+							return;
+						if (!frame || !this.#handleNodeInfoFrame(frame))
+							this.#failNodeInfoRequest(pending);
+					},
+					(error) => {
+						this.#reportError(error);
+						this.#failNodeInfoRequest(pending);
+					},
+				);
+			return;
+		}
 
 		// Z-Wave Protocol CC, Request Node Information Frame. This command does
 		// not request a MAC ACK; the node's NIF is the terminal response.
@@ -1208,6 +1252,7 @@ class ControllerBindingRuntime {
 	#completeNodeInfoRequest(pending: PendingNodeInfoRequest): boolean {
 		if (this.#pendingNodeInfoRequest !== pending) return false;
 		clearTimeout(pending.timeout);
+		pending.abort?.abort();
 		this.#pendingNodeInfoRequest = undefined;
 		return true;
 	}

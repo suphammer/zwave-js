@@ -132,6 +132,16 @@ acknowledgment. A separate Zniffer captured the RF exchange. This validates
 that specific controller path; it does not establish end-device Command
 Class interview coverage or secure inclusion.
 
+A separate EU end-node test used Suphacap `joiner-test` firmware at
+9.6 kbit/s on logical channel 2. The native Driver included node 2, matched
+the peer's assigned identity, decoded a fresh NIF as Basic/Generic/Specific
+`3/0x10/1`, and completed an acknowledged NOP. The joiner used an end-node
+NIF without an explicit Basic byte and a nonblocking 20 ms lab reply guard.
+Requested NIFs hold the receive channel until response or timeout and restore
+normal reception before the Driver receives the result. The minimal joiner
+does not provide Manufacturer or Version reports, so this test did not run a
+complete Command Class interview or security bootstrap.
+
 Successful startup and software tests establish API compatibility, not RF
 qualification. They do not establish certification, calibrated radio power
 or sensitivity, worst-case ACK timing, all-region coverage, or support for
