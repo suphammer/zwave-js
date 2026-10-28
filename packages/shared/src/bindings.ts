@@ -206,6 +206,14 @@ export interface DatabaseFactory {
 export interface Database<V> {
 	open(): Promise<void>;
 	close(): Promise<void>;
+	/**
+	 * Persists all preceding changes before resolving, while retaining database
+	 * ownership. Required for state that must survive a crash before an operation
+	 * can report success. Bindings without this guarantee may omit this method.
+	 * Filesystem bindings should document platform limitations: the Node.js JSONL
+	 * binding syncs replacement directory entries on POSIX but not on Windows.
+	 */
+	flush?(): Promise<void>;
 
 	has: Map<string, V>["has"];
 	get: Map<string, V>["get"];
