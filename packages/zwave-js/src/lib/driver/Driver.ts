@@ -263,6 +263,10 @@ import {
 	createMessageGenerator,
 	isNodeBusyError,
 } from "./MessageGenerators.js";
+import type {
+	ControllerBackendCapabilities,
+	NativeControllerBackend,
+} from "./NativeControllerBackend.js";
 import {
 	cacheKeys,
 	deserializeNetworkCacheValue,
@@ -923,6 +927,18 @@ export class Driver
 	}
 
 	private serialFactory: ZWaveSerialStreamFactory | undefined;
+	private nativeControllerBackend:
+		| Promise<NativeControllerBackend>
+		| undefined;
+	private _controllerBackendCapabilities:
+		| ControllerBackendCapabilities
+		| undefined;
+	/** @internal */
+	public get controllerBackendCapabilities():
+		| ControllerBackendCapabilities
+		| undefined {
+		return this._controllerBackendCapabilities;
+	}
 	/** The serial port instance */
 	private serial: ZWaveSerialStream | undefined;
 
@@ -1704,9 +1720,17 @@ export class Driver
 		setImmediate(async () => {
 			try {
 				await this.openSerialport();
+				if (this.wasDestroyed) {
+					throw new ZWaveError(
+						"The driver was destroyed",
+						ZWaveErrorCodes.Driver_Destroyed,
+					);
+				}
 			} catch (e) {
 				spOpenPromise.reject(e);
-				void this.destroy();
+				void this.destroy().catch(() => {
+					// Explicit destroy() callers can observe cleanup failures.
+				});
 				return;
 			}
 
@@ -1890,46 +1914,63 @@ export class Driver
 
 	private async openSerialport(): Promise<void> {
 		let lastError: unknown;
+		const assertNotDestroyed = () => {
+			if (this.wasDestroyed) {
+				throw new ZWaveError(
+					"The driver was destroyed",
+					ZWaveErrorCodes.Driver_Destroyed,
+				);
+			}
+		};
 		// After a reset, the serial port may need a few seconds until we can open it - try a few times
 		this._isOpeningSerialPort = true;
-		for (
-			let attempt = 1;
-			attempt <= this._options.attempts.openSerialPort;
-			attempt++
-		) {
-			try {
-				this.serial = await this.serialFactory!.createStream();
-				// Start reading from the serial port
-				void this.handleSerialData(this.serial);
+		try {
+			for (
+				let attempt = 1;
+				attempt <= this._options.attempts.openSerialPort;
+				attempt++
+			) {
+				assertNotDestroyed();
+				try {
+					const serial = await this.serialFactory!.createStream();
+					if (this.wasDestroyed) {
+						await serial.close();
+						assertNotDestroyed();
+					}
+					this.serial = serial;
+					// Start reading from the serial port
+					void this.handleSerialData(serial);
 
-				// There are some situations where the serial port closes unexpectedly
-				// after just a few milliseconds, e.g. when reconnecting to a TCP serial port.
-				// Wait a bit to see if this happens.
-				if (getenv("NODE_ENV") !== "test") {
-					await wait(250);
-				}
+					// There are some situations where the serial port closes unexpectedly
+					// after just a few milliseconds, e.g. when reconnecting to a TCP serial port.
+					// Wait a bit to see if this happens.
+					if (getenv("NODE_ENV") !== "test") {
+						await wait(250);
+					}
 
-				if (this.serial.isOpen) {
-					// It is still open, we're done
-					this._isOpeningSerialPort = false;
-					return;
+					assertNotDestroyed();
+					if (serial.isOpen) {
+						// It is still open, we're done
+						return;
+					}
+				} catch (e) {
+					assertNotDestroyed();
+					lastError = e;
 				}
-			} catch (e) {
-				lastError = e;
+				if (attempt < this._options.attempts.openSerialPort) {
+					await wait(1000);
+				}
 			}
-			if (attempt < this._options.attempts.openSerialPort) {
-				await wait(1000);
-			}
+
+			const message = `Failed to open the serial port: ${getErrorMessage(
+				lastError,
+			)}`;
+			this.driverLog.print(message, "error");
+
+			throw new ZWaveError(message, ZWaveErrorCodes.Driver_Failed);
+		} finally {
+			this._isOpeningSerialPort = false;
 		}
-
-		this._isOpeningSerialPort = false;
-
-		const message = `Failed to open the serial port: ${getErrorMessage(
-			lastError,
-		)}`;
-		this.driverLog.print(message, "error");
-
-		throw new ZWaveError(message, ZWaveErrorCodes.Driver_Failed);
 	}
 
 	/** Indicates whether all nodes are ready, i.e. the "all nodes ready" event has been emitted */
@@ -3857,7 +3898,7 @@ export class Driver
 		}
 	}
 
-	private _destroyPromise: DeferredPromise<void> | undefined;
+	private _destroyPromise: Promise<void> | undefined;
 	private get wasDestroyed(): boolean {
 		return !!this._destroyPromise;
 	}
@@ -3898,52 +3939,96 @@ export class Driver
 	}
 
 	private async destroyWithMessage(message: string): Promise<void> {
-		this.driverLog.print(message, "error");
+		try {
+			this.driverLog.print(message, "error");
 
-		const error = new ZWaveError(message, ZWaveErrorCodes.Driver_Failed);
-		this.emit("error", error);
-
-		await this.destroy();
+			const error = new ZWaveError(
+				message,
+				ZWaveErrorCodes.Driver_Failed,
+			);
+			this.emit("error", error);
+		} finally {
+			await this.destroy();
+		}
 	}
 
 	/**
 	 * Terminates the driver instance and closes the underlying serial connection.
 	 * Must be called under any circumstances.
 	 */
-	public async destroy(): Promise<void> {
+	public destroy(): Promise<void> {
 		// Ensure this is only called once and all subsequent calls block
 		if (this._destroyPromise) return this._destroyPromise;
-		this._destroyPromise = createDeferredPromise();
+		const promise = createDeferredPromise<void>();
+		this._destroyPromise = promise;
+		void this.destroyInternal().then(
+			() => promise.resolve(),
+			(error) => promise.reject(error),
+		);
+		return promise;
+	}
 
-		this.driverLog.print("destroying driver instance...");
+	private async destroyInternal(): Promise<void> {
+		const errors: unknown[] = [];
+		const cleanup = async (
+			callback: () => void | Promise<void>,
+		): Promise<void> => {
+			try {
+				await callback();
+			} catch (error) {
+				errors.push(error);
+			}
+		};
+
+		await cleanup(() =>
+			this._driverLog?.print("destroying driver instance..."),
+		);
 
 		// First stop the scheduler, all queues and close the serial port, so nothing happens anymore
-		await this._scheduler.stop();
+		await cleanup(() => this._scheduler.stop());
 
-		await this.destroyTransactionQueues(
-			"driver instance destroyed",
-			ZWaveErrorCodes.Driver_Destroyed,
+		await cleanup(() =>
+			this.destroyTransactionQueues(
+				"driver instance destroyed",
+				ZWaveErrorCodes.Driver_Destroyed,
+			),
 		);
 
-		this.destroySerialAPIQueue(
-			"driver instance destroyed",
-			ZWaveErrorCodes.Driver_Destroyed,
+		await cleanup(() =>
+			this.destroySerialAPIQueue(
+				"driver instance destroyed",
+				ZWaveErrorCodes.Driver_Destroyed,
+			),
 		);
 
-		if (this.serial != undefined) {
-			// Avoid spewing errors if the port was in the middle of receiving something
-			if (this.serial.isOpen) await this.serial.close();
+		await cleanup(async () => {
+			const serial = this.serial;
 			this.serial = undefined;
-		}
+			if (serial != undefined) {
+				// Avoid spewing errors if the port was in the middle of receiving something
+				if (serial.isOpen) await serial.close();
+			}
+		});
+		await cleanup(async () => {
+			const backend = await this.nativeControllerBackend?.catch(
+				() => undefined,
+			);
+			await backend?.destroy();
+		});
 
-		await this.destroyController();
+		await cleanup(() => this.destroyController());
 
-		this.driverLog.print(`driver instance destroyed`);
+		await cleanup(() =>
+			this._driverLog?.print(`driver instance destroyed`),
+		);
 
 		// destroy loggers as the very last thing
-		this._logContainer.destroy();
+		await cleanup(() => this._logContainer?.destroy());
 
-		this._destroyPromise.resolve();
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) {
+			throw new AggregateError(errors, "Driver cleanup failed");
+		}
 	}
 
 	/** Cleanly destroy the controller instance, but not the entire driver */
@@ -8142,6 +8227,7 @@ ${handlers.length} left`,
 	}
 
 	private async abortSendData(): Promise<void> {
+		if (this.controllerBackendCapabilities?.transmitAbort === false) return;
 		try {
 			const abort = new SendDataAbort();
 			await this.writeSerial(

@@ -61,6 +61,7 @@
 - Development
 
   - [Introduction](development/intro.md)
+  - [Software controller and radio backends](development/software-controller.md)
   - [Implementing a Command Class](development/implementing-cc.md)
   - [Type rendering in the docs](development/documenting-types.md)
   - [Installing from GitHub](development/installing-from-github.md)

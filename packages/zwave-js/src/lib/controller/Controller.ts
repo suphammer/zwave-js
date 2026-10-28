@@ -686,7 +686,10 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 	public supportsFeature(feature: ZWaveFeature): MaybeNotKnown<boolean> {
 		switch (feature) {
 			case ZWaveFeature.SmartStart:
-				return this.sdkVersionGte(minFeatureVersions[feature]);
+				return (
+					this.driver.controllerBackendCapabilities?.smartStart
+					?? this.sdkVersionGte(minFeatureVersions[feature])
+				);
 		}
 	}
 
@@ -2208,8 +2211,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 					// kick off the inclusion process
 					const msg = new AddNodeToNetworkRequest({
 						addNodeType: AddNodeType.Any,
-						highPower: true,
-						networkWide: true,
+						highPower:
+							self.driver.controllerBackendCapabilities?.highPower
+							?? true,
+						networkWide:
+							self.driver.controllerBackendCapabilities
+								?.networkWideInclusion ?? true,
 					});
 					yield* waitFor(self.driver.sendMessage(msg));
 					callbackId = msg.callbackId!;
@@ -2334,8 +2341,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 						nwiHomeId: nwiHomeIdFromDSK(dskBuffer),
 						authHomeId: authHomeIdFromDSK(dskBuffer),
 						protocol,
-						highPower: true,
-						networkWide: true,
+						highPower:
+							self.driver.controllerBackendCapabilities?.highPower
+							?? true,
+						networkWide:
+							self.driver.controllerBackendCapabilities
+								?.networkWideInclusion ?? true,
 					});
 					yield* waitFor(self.driver.sendMessage(msg));
 					callbackId = msg.callbackId!;
@@ -2821,8 +2832,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 			new AddNodeToNetworkRequest({
 				callbackId: 0, // disable callbacks
 				addNodeType: AddNodeType.Stop,
-				highPower: true,
-				networkWide: true,
+				highPower:
+					this.driver.controllerBackendCapabilities?.highPower
+					?? true,
+				networkWide:
+					this.driver.controllerBackendCapabilities
+						?.networkWideInclusion ?? true,
 			}),
 		);
 		this.driver.controllerLog.print(`The inclusion process was stopped`);
@@ -2840,8 +2855,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 			await this.driver.sendMessage<AddNodeToNetworkRequestStatusReport>(
 				new AddNodeToNetworkRequest({
 					addNodeType: AddNodeType.Stop,
-					highPower: true,
-					networkWide: true,
+					highPower:
+						this.driver.controllerBackendCapabilities?.highPower
+						?? true,
+					networkWide:
+						this.driver.controllerBackendCapabilities
+							?.networkWideInclusion ?? true,
 				}),
 			);
 		if (response.status === AddNodeStatus.Done) {
@@ -2891,8 +2910,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 			await this.driver.sendMessage(
 				new AddNodeToNetworkRequest({
 					addNodeType: AddNodeType.Stop,
-					highPower: true,
-					networkWide: true,
+					highPower:
+						this.driver.controllerBackendCapabilities?.highPower
+						?? true,
+					networkWide:
+						this.driver.controllerBackendCapabilities
+							?.networkWideInclusion ?? true,
 				}),
 			);
 			this.driver.controllerLog.print(
@@ -2988,8 +3011,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 					new AddNodeToNetworkRequest({
 						callbackId: 0, // disable callbacks
 						addNodeType: AddNodeType.Stop,
-						highPower: true,
-						networkWide: true,
+						highPower:
+							this.driver.controllerBackendCapabilities?.highPower
+							?? true,
+						networkWide:
+							this.driver.controllerBackendCapabilities
+								?.networkWideInclusion ?? true,
 					}),
 				);
 				this.driver.controllerLog.print(
@@ -3028,8 +3055,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 					new AddNodeToNetworkRequest({
 						callbackId: 0, // disable callbacks
 						addNodeType: AddNodeType.Stop,
-						highPower: true,
-						networkWide: true,
+						highPower:
+							this.driver.controllerBackendCapabilities?.highPower
+							?? true,
+						networkWide:
+							this.driver.controllerBackendCapabilities
+								?.networkWideInclusion ?? true,
 					}),
 				);
 				this.driver.controllerLog.print(
@@ -3088,8 +3119,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 			new RemoveNodeFromNetworkRequest({
 				callbackId: 0, // disable callbacks
 				removeNodeType: RemoveNodeType.Stop,
-				highPower: true,
-				networkWide: true,
+				highPower:
+					this.driver.controllerBackendCapabilities?.highPower
+					?? true,
+				networkWide:
+					this.driver.controllerBackendCapabilities
+						?.networkWideInclusion ?? true,
 			}),
 		);
 		this.driver.controllerLog.print(`the exclusion process was stopped`);
@@ -3127,8 +3162,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 			await this.driver.sendMessage(
 				new RemoveNodeFromNetworkRequest({
 					removeNodeType: RemoveNodeType.Stop,
-					highPower: true,
-					networkWide: true,
+					highPower:
+						this.driver.controllerBackendCapabilities?.highPower
+						?? true,
+					networkWide:
+						this.driver.controllerBackendCapabilities
+							?.networkWideInclusion ?? true,
 				}),
 			);
 			this.driver.controllerLog.print(
@@ -3187,8 +3226,12 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 					// kick off the exclusion process
 					const msg = new RemoveNodeFromNetworkRequest({
 						removeNodeType: RemoveNodeType.Any,
-						highPower: true,
-						networkWide: true,
+						highPower:
+							self.driver.controllerBackendCapabilities?.highPower
+							?? true,
+						networkWide:
+							self.driver.controllerBackendCapabilities
+								?.networkWideInclusion ?? true,
 					});
 					yield* waitFor(self.driver.sendMessage(msg));
 					callbackId = msg.callbackId!;
