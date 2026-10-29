@@ -30,6 +30,10 @@ import { Bytes, type BytesView } from "@zwave-js/shared";
 import type { ControllerFirmwareInfo } from "../driver/ControllerFirmwareInfo.js";
 
 import {
+	ApplicationResponseWindow,
+	shouldHoldApplicationResponse,
+} from "./ApplicationResponseWindow.js";
+import {
 	ControllerTransmitStatus,
 	type ControllerApplicationFrame,
 	type ControllerExclusionEvent,
@@ -514,6 +518,9 @@ export class SoftwareController implements RawControllerTransport {
 	#sendInFlight = false;
 	#activeSend: Promise<unknown> | undefined;
 	#nodeInformationRequest: NodeInformationRequest | undefined;
+	readonly #applicationResponseWindow = new ApplicationResponseWindow(() =>
+		this.#expireApplicationResponseWindow(),
+	);
 	#persistenceTail: Promise<void> = Promise.resolve();
 	#persistenceError: { error: unknown } | undefined;
 	#stopOperation: Promise<void> | undefined;
@@ -585,6 +592,7 @@ export class SoftwareController implements RawControllerTransport {
 		if (this.#factoryDefaultOperation) {
 			throw new Error("Controller factory-default is already active");
 		}
+		this.#applicationResponseWindow.cancel();
 		// Defer the implementation by one microtask so the operation fence is
 		// visible before any cancellation or I/O can run.
 		const operation = Promise.resolve().then(() =>
@@ -1075,6 +1083,7 @@ export class SoftwareController implements RawControllerTransport {
 	}
 
 	async #stop(): Promise<void> {
+		this.#applicationResponseWindow.cancel();
 		if (!this.#started) {
 			await this.#persistenceTail;
 			const errors = [...this.#startupCleanupErrors];
@@ -1241,7 +1250,7 @@ export class SoftwareController implements RawControllerTransport {
 		}
 
 		this.#sendInFlight = true;
-		const operation = this.#sendAcrossClassicChannels(request);
+		const operation = this.#sendAcrossClassicChannels(request, false, true);
 		this.#activeSend = operation;
 		try {
 			return await operation;
@@ -1254,6 +1263,7 @@ export class SoftwareController implements RawControllerTransport {
 	async #sendAcrossClassicChannels(
 		request: ControllerTransmitRequest,
 		holdRx = false,
+		applicationResponse = false,
 	): Promise<ControllerTransmitResult> {
 		const flirsBeamMode = beamModeFromProtocolInfo(
 			this.#nodeProtocolInfo.get(request.destinationNodeId),
@@ -1316,6 +1326,8 @@ export class SoftwareController implements RawControllerTransport {
 			false,
 			selectedRoute ?? (beamMode ? null : undefined),
 			beamMode ?? null,
+			false,
+			applicationResponse,
 		);
 		if (flirsBeamMode) {
 			if (
@@ -1588,6 +1600,7 @@ export class SoftwareController implements RawControllerTransport {
 		routeOverride?: readonly number[] | null,
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
 		speedModified = false,
+		applicationResponse = false,
 	): Promise<ControllerTransmitResult> {
 		const destinationBeamMode =
 			destinationBeamModeOverride === undefined
@@ -1620,6 +1633,15 @@ export class SoftwareController implements RawControllerTransport {
 			&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0
 			&& routedRepeaters === undefined;
 		const beamMode = directRoute ? destinationBeamMode : undefined;
+		const holdApplicationResponse =
+			applicationResponse
+			&& !holdRx
+			&& !alternateRx
+			&& shouldHoldApplicationResponse(
+				request.command,
+				directRoute,
+				!!beamMode,
+			);
 		if (
 			beamMode
 			&& (!this.#radio.capabilities.beamTx
@@ -1637,10 +1659,23 @@ export class SoftwareController implements RawControllerTransport {
 		const result = await this.#transmitMPDU(
 			mpdu,
 			channel,
-			holdRx,
+			holdRx || holdApplicationResponse,
 			alternateRx,
 			beamMode,
 		);
+		if (holdApplicationResponse) {
+			if (
+				result.status === ControllerTransmitStatus.OK
+				&& this.#started
+				&& !this.#faulted
+				&& !this.#stopOperation
+				&& !this.#factoryDefaultOperation
+			) {
+				this.#applicationResponseWindow.retain();
+			} else {
+				await this.#restoreNormalFiltering();
+			}
+		}
 		if (
 			result.status !== ControllerTransmitStatus.OK
 			|| (!directRoute && !routedRepeaters?.length)
@@ -1843,7 +1878,9 @@ export class SoftwareController implements RawControllerTransport {
 	async #restoreNormalFiltering(): Promise<void> {
 		if (!this.#started) return;
 		const mode =
-			this.#faulted || this.#factoryDefaultOperation
+			this.#faulted
+			|| this.#factoryDefaultOperation
+			|| this.#stopOperation
 				? "disabled"
 				: "network";
 		try {
@@ -2897,12 +2934,41 @@ export class SoftwareController implements RawControllerTransport {
 		homeId = this.#normalized.homeId,
 		ownNodeId = this.#normalized.ownNodeId,
 	): Promise<void> {
+		this.#applicationResponseWindow.cancel();
 		await radio.configure({
 			homeId,
 			ownNodeId,
 			filterHomeId: mode === "network",
 			autoAck: mode !== "disabled",
 		});
+	}
+
+	#expireApplicationResponseWindow(): void {
+		if (
+			!this.#started
+			|| this.#faulted
+			|| this.#stopOperation
+			|| this.#sendInFlight
+			|| this.#networkManagementSession
+			|| this.#factoryDefaultOperation
+		)
+			return;
+		// Take the same fence as a transmission before the first async radio call.
+		// A new TX can supersede an idle lease, but cannot race its RX restore.
+		this.#sendInFlight = true;
+		const operation = this.#restoreNormalFiltering()
+			.catch((error: unknown) => {
+				this.#handleRadioError(error);
+				throw error;
+			})
+			.finally(() => {
+				if (this.#activeSend === operation) {
+					this.#activeSend = undefined;
+					this.#sendInFlight = false;
+				}
+			});
+		this.#activeSend = operation;
+		void operation.catch(() => undefined);
 	}
 
 	async #transmitMPDU(
@@ -2912,6 +2978,7 @@ export class SoftwareController implements RawControllerTransport {
 		alternateRx = false,
 		beamMode?: SoftwareControllerBeamMode,
 	) {
+		this.#applicationResponseWindow.cancel();
 		try {
 			return await this.#radio.transmit({
 				mpdu,
@@ -3436,6 +3503,7 @@ export class SoftwareController implements RawControllerTransport {
 	};
 
 	readonly #handleRadioError = (error: unknown): void => {
+		this.#applicationResponseWindow.cancel();
 		this.#nodeInformationRequest?.cancel();
 		if (this.#networkManagementSession) {
 			this.#stopTransferPresentation(this.#networkManagementSession);

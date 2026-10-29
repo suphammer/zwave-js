@@ -51,6 +51,7 @@ export interface SoftwareControllerRadioTransmitRequest {
 	txPowerDeciDbm?: number;
 	cca: boolean;
 	maxAttempts: 1 | 2 | 3;
+	/** Retains RX atomically on the TX channel until the next transmit/configure. */
 	holdRx: boolean;
 	alternateRx: boolean;
 	beamMode?: SoftwareControllerBeamMode;
@@ -86,6 +87,7 @@ export interface SoftwareControllerRadio {
 		onMPDU: (mpdu: MPDU, info: SoftwareControllerMPDURxInfo) => void,
 		onError: (error: unknown) => void,
 	): Promise<SoftwareControllerRegionConfig>;
+	/** Clears retained transmit placement and resumes the radio's normal receive policy. */
 	configure(
 		configuration: SoftwareControllerRadioConfiguration,
 	): Promise<void>;

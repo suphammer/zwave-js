@@ -33,6 +33,23 @@ errors trigger the same receiver cleanup; shutdown and fault cleanup disable MAC
 instead of re-enabling normal traffic. Ordinary `send` results still report
 transmit completion, independently of a later application response.
 
+Ordinary acknowledged direct application traffic retains reception on its
+transmit channel atomically when the radio finishes the MAC transaction. A
+successful transmit starts a bounded 250 ms idle response window; reports are
+forwarded immediately and do not end it early. The transmit callback still
+reports MAC completion, without waiting for or inventing an application reply.
+A new transmit or MAC configuration supersedes the idle window without first
+retuning away from that channel. At expiry, normal receive/hopping restoration
+takes the existing transmit fence, so it cannot race a newer operation.
+
+Failed held transmissions restore reception before releasing the fence.
+Management, reset, stop, and radio faults cancel stale deadlines; stop waits for
+an already-running restoration, and fault/reset/shutdown cleanup disables MAC.
+NOP, Protocol CC, routed and broadcast traffic retain their existing policy.
+The separate atomic wake-up-beam contract does not support a held response
+window, so a transmit requiring a beam is excluded. These software boundaries
+do not qualify routed or FLiRS response timing in hardware.
+
 Capabilities describe implemented contracts. They do not follow from a
 manufacturer name, a guessed SDK version, or a successfully queued command.
 Unsupported SmartStart, Network Wide Inclusion, high-power overrides, and
