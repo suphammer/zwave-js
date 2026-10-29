@@ -50,6 +50,11 @@ reports MAC completion, without waiting for or inventing an application reply.
 A new transmit or MAC configuration supersedes the idle window without first
 retuning away from that channel. At expiry, normal receive/hopping restoration
 takes the existing transmit fence, so it cannot race a newer operation.
+If a delayed report arrives during this bounded internal restoration, its next
+application send or Request Node Information waits for that restoration and then rechecks controller
+lifecycle, network-management, and transmit ownership. A genuine active transmit
+still returns `NotIdle`; waiting does not bypass its fence. Restoration failure
+fails the waiting command without transmitting.
 
 Failed held transmissions restore reception before releasing the fence.
 Management, reset, stop, and radio faults cancel stale deadlines; stop waits for

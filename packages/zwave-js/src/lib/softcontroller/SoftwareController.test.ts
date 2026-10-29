@@ -11,11 +11,15 @@ import {
 	SinglecastZWaveMPDU,
 } from "@zwave-js/core";
 import { Bytes } from "@zwave-js/shared";
+import { createDeferredPromise } from "alcalzone-shared/deferred-promise";
 import { afterEach, expect, test, vi } from "vitest";
 
+import { APPLICATION_RESPONSE_WINDOW_MS } from "./ApplicationResponseWindow.js";
 import {
 	ControllerTransmitStatus,
+	type ControllerApplicationFrame,
 	type ControllerInclusionEvent,
+	type ControllerTransmitResult,
 } from "./ControllerBackend.js";
 import {
 	parseControllerState,
@@ -234,3 +238,249 @@ test.each([
 		}
 	},
 );
+
+async function responseRestoreFixture() {
+	vi.useFakeTimers();
+	const homeId = 0x12345678;
+	const restore = createDeferredPromise<void>();
+	void restore.catch(() => undefined);
+	const errors: unknown[] = [];
+	let receive!: Parameters<SoftwareControllerRadio["start"]>[0];
+	let onFrame: ((frame: ControllerApplicationFrame) => void) | undefined;
+	const transmit = vi.fn<SoftwareControllerRadio["transmit"]>(async () => ({
+		status: ControllerTransmitStatus.OK,
+	}));
+	const configure = vi.fn<SoftwareControllerRadio["configure"]>(
+		async () => {},
+	);
+	const radio: SoftwareControllerRadio = {
+		capabilities: {
+			localAck: true,
+			localTransmitAck: true,
+			explorerTargetReply: true,
+			routedAckStatus: true,
+			explorerTx: false,
+			beamTx: false,
+		},
+		limits: { maximumMPDUSize: 64, maximumBeamMPDUSize: 0 },
+		start: async (callback) => {
+			receive = callback;
+			return {
+				region: RFRegion.Europe,
+				channelConfig: ChannelConfiguration.Classic,
+				channels: [
+					{
+						channel: 1,
+						frequency: 868400000,
+						dataRate: ProtocolDataRate.ZWave_40k,
+					},
+				],
+			};
+		},
+		transmit,
+		configure,
+		stop: async () => {},
+	};
+	const controller = new SoftwareController({
+		radioFactory: () => radio,
+		region: RFRegion.Europe,
+		homeId,
+		channel: 1,
+		includedNodeIds: [1, 2],
+		nodeChannels: new Map([[2, 1]]),
+		onControllerStateChanged: () => {},
+		onError: (error) => errors.push(error),
+	});
+	await controller.start((frame) => onFrame?.(frame));
+	const request = {
+		destinationNodeId: 2,
+		command: Bytes.from([0x86, 0x13, 0x72]),
+		transmitOptions: 1,
+	};
+	const receiveCommand = (command: Bytes) =>
+		receive(
+			new SinglecastZWaveMPDU({
+				homeId,
+				sourceNodeId: 2,
+				destinationNodeId: 1,
+				ackRequested: false,
+				sequenceNumber: 1,
+				speedModified: false,
+				payload: command,
+			}),
+			{ channel: 1, protocolDataRate: ProtocolDataRate.ZWave_40k },
+		);
+	return {
+		controller,
+		request,
+		restore,
+		errors,
+		transmit,
+		configure,
+		receiveCommand,
+		onFrame: (callback: typeof onFrame) => {
+			onFrame = callback;
+		},
+		beginRestore: async () => {
+			expect((await controller.send(request)).status).toBe(
+				ControllerTransmitStatus.OK,
+			);
+			configure.mockImplementationOnce(async () => {
+				await restore;
+			});
+			await vi.advanceTimersByTimeAsync(APPLICATION_RESPONSE_WINDOW_MS);
+			expect(configure).toHaveBeenCalledTimes(2);
+		},
+		close: async () => {
+			restore.resolve();
+			await controller.stop();
+		},
+	};
+}
+
+test("a delayed application response waits for internal RX restoration before its next send", async () => {
+	const fixture = await responseRestoreFixture();
+	try {
+		await fixture.beginRestore();
+		let next: Promise<ControllerTransmitResult> | undefined;
+		let completed = false;
+		fixture.onFrame(() => {
+			next = fixture.controller.send(fixture.request).then((result) => {
+				completed = true;
+				return result;
+			});
+		});
+		fixture.receiveCommand(Bytes.from([0x86, 0x14, 0x72, 2]));
+		await Promise.resolve();
+		expect(completed).toBe(false);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		fixture.restore.resolve();
+		expect((await next)?.status).toBe(ControllerTransmitStatus.OK);
+		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("a rejected RX restore fails its waiting send without transmitting", async () => {
+	const fixture = await responseRestoreFixture();
+	try {
+		await fixture.beginRestore();
+		const next = fixture.controller.send(fixture.request);
+		fixture.restore.reject(new Error("restore failed"));
+		expect((await next).status).toBe(ControllerTransmitStatus.Fail);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		expect(fixture.configure.mock.lastCall?.[0].autoAck).toBe(false);
+		expect(fixture.errors).toHaveLength(1);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("stop while a send awaits RX restoration prevents a later transmission", async () => {
+	const fixture = await responseRestoreFixture();
+	try {
+		await fixture.beginRestore();
+		const next = fixture.controller.send(fixture.request);
+		const stopping = fixture.controller.stop();
+		fixture.restore.resolve();
+		await stopping;
+		expect((await next).status).toBe(ControllerTransmitStatus.Fail);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("factory reset invalidates a send suspended on the previous network's RX restore", async () => {
+	const fixture = await responseRestoreFixture();
+	try {
+		await fixture.beginRestore();
+		const next = fixture.controller.send(fixture.request);
+		const resetting = fixture.controller.factoryDefault!();
+		fixture.restore.resolve();
+		await resetting;
+		expect((await next).status).toBe(ControllerTransmitStatus.Fail);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("concurrent RX-restore waiters still compete for the ordinary transmit fence", async () => {
+	const fixture = await responseRestoreFixture();
+	try {
+		await fixture.beginRestore();
+		const first = fixture.controller.send(fixture.request);
+		const second = fixture.controller.send(fixture.request);
+		fixture.restore.resolve();
+		expect((await first).status).toBe(ControllerTransmitStatus.OK);
+		expect((await second).status).toBe(ControllerTransmitStatus.NotIdle);
+		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("genuine active TX remains NotIdle and is not awaited or reconfigured", async () => {
+	const fixture = await responseRestoreFixture();
+	const transmitDone = createDeferredPromise<void>();
+	try {
+		fixture.transmit.mockImplementationOnce(async () => {
+			await transmitDone;
+			return { status: ControllerTransmitStatus.OK };
+		});
+		const first = fixture.controller.send(fixture.request);
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.NotIdle,
+		);
+		expect(
+			await fixture.controller.requestNodeInformation(2, 500),
+		).toBeUndefined();
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		expect(fixture.configure).toHaveBeenCalledTimes(1);
+		transmitDone.resolve();
+		await first;
+	} finally {
+		transmitDone.resolve();
+		await fixture.close();
+	}
+});
+
+test("Request Node Information waits for RX cleanup before starting its own response window", async () => {
+	const fixture = await responseRestoreFixture();
+	try {
+		await fixture.beginRestore();
+		const nif = Bytes.from("0101d39c0010012527", "hex");
+		fixture.transmit.mockImplementationOnce(async () => {
+			fixture.receiveCommand(nif);
+			return { status: ControllerTransmitStatus.OK };
+		});
+		const next = fixture.controller.requestNodeInformation(2, 500);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		fixture.restore.resolve();
+		expect((await next)?.command).toEqual(Uint8Array.from(nif));
+		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("a node-info request canceled during RX cleanup cannot transmit afterwards", async () => {
+	const fixture = await responseRestoreFixture();
+	try {
+		await fixture.beginRestore();
+		const abort = new AbortController();
+		const next = fixture.controller.requestNodeInformation(
+			2,
+			500,
+			abort.signal,
+		);
+		abort.abort();
+		fixture.restore.resolve();
+		expect(await next).toBeUndefined();
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+	} finally {
+		await fixture.close();
+	}
+});

@@ -522,6 +522,7 @@ export class SoftwareController implements RawControllerTransport {
 	#sequenceNumber: number | undefined;
 	#sendInFlight = false;
 	#activeSend: Promise<unknown> | undefined;
+	#applicationResponseRestore: Promise<void> | undefined;
 	#nodeInformationRequest: NodeInformationRequest | undefined;
 	readonly #applicationResponseWindow = new ApplicationResponseWindow(() =>
 		this.#expireApplicationResponseWindow(),
@@ -1155,6 +1156,12 @@ export class SoftwareController implements RawControllerTransport {
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<ControllerApplicationFrame | undefined> {
+		const restore = this.#applicationResponseRestore;
+		if (
+			restore
+			&& !(await this.#waitForApplicationResponseRestore(restore))
+		)
+			return;
 		if (
 			!this.#started
 			|| !this.#regionConfig
@@ -1229,6 +1236,13 @@ export class SoftwareController implements RawControllerTransport {
 	public async send(
 		request: ControllerTransmitRequest,
 	): Promise<ControllerTransmitResult> {
+		const restore = this.#applicationResponseRestore;
+		if (
+			restore
+			&& !(await this.#waitForApplicationResponseRestore(restore))
+		) {
+			return { status: ControllerTransmitStatus.Fail };
+		}
 		if (!this.#regionConfig || !this.#started) {
 			throw new Error("Software controller is not started");
 		}
@@ -2988,6 +3002,20 @@ export class SoftwareController implements RawControllerTransport {
 		});
 	}
 
+	async #waitForApplicationResponseRestore(
+		restore: Promise<void>,
+	): Promise<boolean> {
+		const epoch = this.#networkStateEpoch;
+		// Late replies can schedule the next query during idle RX cleanup.
+		// Await that bounded internal operation, never an unrelated active TX.
+		try {
+			await restore;
+		} catch {
+			return false;
+		}
+		return !this.#stopOperation && this.#networkStateEpoch === epoch;
+	}
+
 	#expireApplicationResponseWindow(): void {
 		if (
 			!this.#started
@@ -3007,12 +3035,16 @@ export class SoftwareController implements RawControllerTransport {
 				throw error;
 			})
 			.finally(() => {
+				if (this.#applicationResponseRestore === operation) {
+					this.#applicationResponseRestore = undefined;
+				}
 				if (this.#activeSend === operation) {
 					this.#activeSend = undefined;
 					this.#sendInFlight = false;
 				}
 			});
 		this.#activeSend = operation;
+		this.#applicationResponseRestore = operation;
 		void operation.catch(() => undefined);
 	}
 
