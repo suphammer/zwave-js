@@ -21,6 +21,7 @@ import {
 	NormalExplorerZWaveMPDU,
 	SearchResultExplorerZWaveMPDU,
 	getProtocolHeaderFormat,
+	parseNodeProtocolInfo,
 	protocolDataRateToString,
 	rfRegionToRadioProtocolMode,
 	type NodeInformationFrame,
@@ -1345,7 +1346,7 @@ export class SoftwareController implements RawControllerTransport {
 			false,
 			selectedRoute ?? (beamMode ? null : undefined),
 			beamMode ?? null,
-			false,
+			undefined,
 			applicationResponse,
 		);
 		if (flirsBeamMode) {
@@ -1585,7 +1586,7 @@ export class SoftwareController implements RawControllerTransport {
 		alternateRx = false,
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
 		routeOverride?: readonly number[] | null,
-		speedModified = false,
+		speedModified?: boolean,
 		radioOptions?: SoftwareControllerRadioTransmitOptions,
 	): Promise<ControllerTransmitResult> {
 		if (this.#sendInFlight || this.#factoryDefaultOperation) {
@@ -1621,7 +1622,7 @@ export class SoftwareController implements RawControllerTransport {
 		alternateRx: boolean,
 		routeOverride?: readonly number[] | null,
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
-		speedModified = false,
+		speedModified?: boolean,
 		applicationResponse = false,
 		radioOptions?: SoftwareControllerRadioTransmitOptions,
 	): Promise<ControllerTransmitResult> {
@@ -1977,6 +1978,26 @@ export class SoftwareController implements RawControllerTransport {
 				.dataRate,
 			channels.map((candidate) => candidate.dataRate),
 			peerBitRates,
+		);
+	}
+
+	#knownPeerSpeedModified(
+		homeId: number,
+		nodeId: number,
+		channel: number,
+	): boolean {
+		if (
+			homeId !== this.#normalized.homeId
+			|| !this.#includedNodeIds.has(nodeId)
+		)
+			return false;
+		const protocolInfo = this.#nodeProtocolInfo.get(nodeId);
+		return (
+			protocolInfo !== undefined
+			&& this.#assignmentSpeedModified(
+				channel,
+				parseNodeProtocolInfo(protocolInfo, 0).supportedDataRates,
+			)
 		);
 	}
 
@@ -3081,7 +3102,7 @@ export class SoftwareController implements RawControllerTransport {
 		homeId = this.#normalized.homeId,
 		routeOverride?: readonly number[] | null,
 		destinationBeamMode?: SoftwareControllerBeamMode,
-		speedModified = false,
+		speedModified?: boolean,
 	): Bytes {
 		const channel = this.#regionConfig!.channels.find(
 			(candidate) => candidate.channel === channelNumber,
@@ -3104,14 +3125,18 @@ export class SoftwareController implements RawControllerTransport {
 				request.destinationNodeId !== NODE_ID_BROADCAST
 				&& !!(request.transmitOptions & TRANSMIT_OPTION_ACK),
 			sequenceNumber,
-			// A learning NIF supplies peer capabilities before its network identity
-			// is stable. A reduced direct rate must be marked independently of the
-			// logical channel number (G.9959 §8.1.3.3.4).
+			// Commissioning supplies an explicit peer NIF. Ordinary traffic uses
+			// only the retained capabilities of this network's assigned destination.
 			speedModified:
-				speedModified
-				&& headerFormat === ProtocolHeaderFormat.Classic2Channel
+				headerFormat === ProtocolHeaderFormat.Classic2Channel
 				&& !repeaters
-				&& request.destinationNodeId !== NODE_ID_BROADCAST,
+				&& request.destinationNodeId !== NODE_ID_BROADCAST
+				&& (speedModified
+					?? this.#knownPeerSpeedModified(
+						homeId,
+						request.destinationNodeId,
+						channelNumber,
+					)),
 			payload: request.command,
 		};
 		const mpdu = repeaters

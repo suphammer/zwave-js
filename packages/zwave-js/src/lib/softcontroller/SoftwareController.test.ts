@@ -8,6 +8,7 @@ import {
 	MPDU,
 	ProtocolDataRate,
 	RFRegion,
+	RoutedZWaveMPDU,
 	SinglecastZWaveMPDU,
 } from "@zwave-js/core";
 import { Bytes } from "@zwave-js/shared";
@@ -28,6 +29,7 @@ import {
 import {
 	normalizeInclusionChannel,
 	SoftwareController,
+	type SoftwareControllerOptions,
 } from "./SoftwareController.js";
 import type {
 	SoftwareControllerMPDURxInfo,
@@ -239,9 +241,36 @@ test.each([
 	},
 );
 
-async function responseRestoreFixture() {
+async function responseRestoreFixture(
+	options: Partial<SoftwareControllerOptions> = {},
+) {
 	vi.useFakeTimers();
-	const homeId = 0x12345678;
+	const homeId = options.homeId ?? 0x12345678;
+	const region = options.region ?? RFRegion.Europe;
+	const channels =
+		region === RFRegion.Japan
+			? [922500000, 923900000, 926300000].map((frequency, channel) => ({
+					channel,
+					frequency,
+					dataRate: ProtocolDataRate.ZWave_100k,
+				}))
+			: [
+					{
+						channel: 0,
+						frequency: 869850000,
+						dataRate: ProtocolDataRate.ZWave_100k,
+					},
+					{
+						channel: 1,
+						frequency: 868400000,
+						dataRate: ProtocolDataRate.ZWave_40k,
+					},
+					{
+						channel: 2,
+						frequency: 868400000,
+						dataRate: ProtocolDataRate.ZWave_9k6,
+					},
+				];
 	const restore = createDeferredPromise<void>();
 	void restore.catch(() => undefined);
 	const errors: unknown[] = [];
@@ -261,20 +290,15 @@ async function responseRestoreFixture() {
 			routedAckStatus: true,
 			explorerTx: false,
 			beamTx: false,
+			foreignHomeIdAcknowledgement: true,
 		},
 		limits: { maximumMPDUSize: 64, maximumBeamMPDUSize: 0 },
 		start: async (callback) => {
 			receive = callback;
 			return {
-				region: RFRegion.Europe,
+				region,
 				channelConfig: ChannelConfiguration.Classic,
-				channels: [
-					{
-						channel: 1,
-						frequency: 868400000,
-						dataRate: ProtocolDataRate.ZWave_40k,
-					},
-				],
+				channels,
 			};
 		},
 		transmit,
@@ -283,13 +307,14 @@ async function responseRestoreFixture() {
 	};
 	const controller = new SoftwareController({
 		radioFactory: () => radio,
-		region: RFRegion.Europe,
+		region,
 		homeId,
 		channel: 1,
 		includedNodeIds: [1, 2],
 		nodeChannels: new Map([[2, 1]]),
 		onControllerStateChanged: () => {},
 		onError: (error) => errors.push(error),
+		...options,
 	});
 	await controller.start((frame) => onFrame?.(frame));
 	const request = {
@@ -318,6 +343,8 @@ async function responseRestoreFixture() {
 		transmit,
 		configure,
 		receiveCommand,
+		receiveFrame: (mpdu: MPDU, info: SoftwareControllerMPDURxInfo) =>
+			receive(mpdu, info),
 		onFrame: (callback: typeof onFrame) => {
 			onFrame = callback;
 		},
@@ -357,6 +384,149 @@ test("a delayed application response waits for internal RX restoration before it
 		fixture.restore.resolve();
 		expect((await next)?.status).toBe(ControllerTransmitStatus.OK);
 		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each([
+	{ nif: "d39c01", channel: 2, modified: true },
+	{ nif: "d39c01", channel: 1, modified: true },
+	{ nif: "d39c01", channel: 0, modified: false },
+	{ nif: "d39c00", channel: 1, modified: false },
+	{ nif: "d39c00", channel: 2, modified: true },
+	{ nif: undefined, channel: 2, modified: false },
+])(
+	"serializes normal GET at channel $channel from peer NIF $nif with Speed Modified=$modified",
+	async ({ nif, channel, modified }) => {
+		const fixture = await responseRestoreFixture({
+			channel,
+			nodeChannels: new Map([[2, channel]]),
+			nodeProtocolInfo: nif
+				? new Map([[2, Bytes.from(`${nif}041001`, "hex")]])
+				: undefined,
+		});
+		try {
+			expect(
+				(await fixture.controller.send(fixture.request)).status,
+			).toBe(ControllerTransmitStatus.OK);
+			const tx = fixture.transmit.mock.calls[0][0];
+			const rate = [
+				ProtocolDataRate.ZWave_100k,
+				ProtocolDataRate.ZWave_40k,
+				ProtocolDataRate.ZWave_9k6,
+			][channel];
+			const frame = MPDU.parse(tx.mpdu, {
+				region: RFRegion.Europe,
+				channel,
+				protocolDataRate: rate,
+			});
+			if (!(frame instanceof SinglecastZWaveMPDU))
+				throw new Error("Expected a direct GET");
+			expect(frame.speedModified).toBe(modified);
+			expect(tx.mpdu[5] & 0x10).toBe(modified ? 0x10 : 0);
+			expect(frame.homeId).toBe(0x12345678);
+			expect(frame.destinationNodeId).toBe(2);
+			expect(Array.from(frame.payload)).toEqual(
+				Array.from(fixture.request.command),
+			);
+			expect(tx.holdRx).toBe(true);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["routed", "broadcast", "configuration 3"])(
+	"does not apply the direct Classic 1/2 speed flag to %s",
+	async (kind) => {
+		const configuration3 = kind === "configuration 3";
+		const channel = configuration3 ? 0 : 2;
+		const region = configuration3 ? RFRegion.Japan : RFRegion.Europe;
+		const fixture = await responseRestoreFixture({
+			region,
+			channel,
+			includedNodeIds: [1, 2, 3],
+			nodeChannels: new Map([[2, channel]]),
+			nodeProtocolInfo: new Map([[2, Bytes.from("d39c01041001", "hex")]]),
+			...(kind === "routed" ? { routes: new Map([[2, [3]]]) } : {}),
+		});
+		try {
+			const request =
+				kind === "broadcast"
+					? { ...fixture.request, destinationNodeId: 0xff }
+					: fixture.request;
+			expect((await fixture.controller.send(request)).status).toBe(
+				ControllerTransmitStatus.OK,
+			);
+			const tx = fixture.transmit.mock.calls[0][0];
+			const frame = MPDU.parse(tx.mpdu, {
+				region,
+				channel,
+				protocolDataRate: configuration3
+					? ProtocolDataRate.ZWave_100k
+					: ProtocolDataRate.ZWave_9k6,
+			});
+			if (
+				!(
+					frame instanceof SinglecastZWaveMPDU
+					|| frame instanceof RoutedZWaveMPDU
+				)
+			)
+				throw new Error("Expected a Classic DATA frame");
+			expect(frame.speedModified).toBe(false);
+			expect(tx.mpdu[5] & 0x10).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("a foreign exclusion's explicit false speed override ignores a numerically matching local 100 kbit/s peer", async () => {
+	const fixture = await responseRestoreFixture({
+		nodeProtocolInfo: new Map([[2, Bytes.from("d39c01041001", "hex")]]),
+	});
+	try {
+		const events: string[] = [];
+		await fixture.controller.networkManagement.beginExclusion(
+			{ nodeType: "any", networkWide: false, highPower: false },
+			(event) => events.push(event.type),
+		);
+		fixture.receiveFrame(
+			new SinglecastZWaveMPDU({
+				homeId: 0x87654321,
+				sourceNodeId: 2,
+				destinationNodeId: 1,
+				ackRequested: false,
+				sequenceNumber: 1,
+				speedModified: false,
+				payload: Bytes.from("0101d39c0010012527", "hex"),
+			}),
+			{ channel: 1, protocolDataRate: ProtocolDataRate.ZWave_40k },
+		);
+		await vi.advanceTimersByTimeAsync(50);
+		const assignment = fixture.transmit.mock.calls
+			.map(([tx]) => ({
+				tx,
+				frame: MPDU.parse(tx.mpdu, {
+					region: RFRegion.Europe,
+					channel: tx.channel,
+					protocolDataRate:
+						tx.channel === 1
+							? ProtocolDataRate.ZWave_40k
+							: ProtocolDataRate.ZWave_9k6,
+				}),
+			}))
+			.find(
+				({ frame }) => frame.payload[0] === 1 && frame.payload[1] === 3,
+			);
+		expect(assignment).toBeDefined();
+		if (!(assignment!.frame instanceof SinglecastZWaveMPDU))
+			throw new Error("Expected a direct assignment");
+		expect(assignment!.frame.speedModified).toBe(false);
+		expect(assignment!.frame.homeId).toBe(0x12345678);
+		expect(assignment!.tx.acknowledgementHomeId).toBe(0x87654321);
+		expect(events).toEqual(["node-found", "removing-node", "done"]);
 	} finally {
 		await fixture.close();
 	}

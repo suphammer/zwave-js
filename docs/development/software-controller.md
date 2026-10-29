@@ -64,6 +64,22 @@ The separate atomic wake-up-beam contract does not support a held response
 window, so a transmit requiring a beam is excluded. These software boundaries
 do not qualify routed or FLiRS response timing in hardware.
 
+## Direct transmit data-rate flag
+
+For Classic channel configurations 1/2, direct transmissions below the known
+shared maximum set Speed Modified, as specified by
+[G.9959 §8.1.3.3.4](https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-G.9959-201501-I!!PDF-E&type=items).
+Ordinary application DATA, Request Node Information, and NOP probes derive the
+default from the retained NIF of an included destination on this controller's
+Home ID. Missing NIF information does not imply a higher supported rate.
+
+Commissioning and exclusion retain their explicit peer-capability overrides,
+including an explicit false value when a foreign device shares a numeric node
+ID with a local device. The flag is clear at the shared maximum and is not
+applied to broadcast, routed, or configuration-3 frames. This changes neither
+the selected PHY, payload, retry policy nor receive-window ownership. Correct
+flag encoding alone does not prove receipt of an application response.
+
 ## End-node inclusion verification
 
 After Assign IDs, an end node's new identity is verified with an acknowledged,
@@ -121,8 +137,8 @@ the radio and the peer's received NIF. For example, a 9.6 kbit/s assignment to
 a 40 kbit/s peer sets the bit. This follows
 [G.9959 §8.1.3.3.4](https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-G.9959-201501-I!!PDF-E&type=items);
 it does not change the selected rate or infer peer capabilities from an
-unrelated local node with the same numeric ID. Broadcast, routed, and ordinary
-application transmit policy are unchanged.
+unrelated local node with the same numeric ID. Broadcast and routed transmit
+policy are unchanged.
 
 Foreign exclusion does not use ordinary NOP verification on the controller's
 network; see the [Silicon Labs protocol change notes](https://docs.silabs.com/z-wave/7.24.0/zwave-api/).
