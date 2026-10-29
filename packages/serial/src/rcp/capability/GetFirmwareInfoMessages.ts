@@ -3,6 +3,7 @@ import {
 	encodeBitMask,
 	logList,
 	parseBitMask,
+	validatePayload,
 } from "@zwave-js/core";
 import { Bytes, getEnumMemberName } from "@zwave-js/shared";
 
@@ -48,6 +49,7 @@ export class GetFirmwareInfoResponse extends RCPMessage {
 		raw: RCPMessageRaw,
 		_ctx: RCPMessageParsingContext,
 	): GetFirmwareInfoResponse {
+		validatePayload(raw.payload.length >= 8);
 		let offset = 0;
 		const majorVersion = raw.payload[offset++];
 		const minorVersion = raw.payload[offset++];
@@ -62,6 +64,9 @@ export class GetFirmwareInfoResponse extends RCPMessage {
 		const radioLibraryVersion = `${radioMajorVersion}.${radioMinorVersion}.${radioPatchVersion}`;
 
 		const functionTypeBitmaskLength = raw.payload[offset++];
+		validatePayload(
+			raw.payload.length >= offset + functionTypeBitmaskLength,
+		);
 		const supportedFunctionTypes: RCPFunctionType[] = parseBitMask(
 			raw.payload.slice(offset, offset + functionTypeBitmaskLength),
 		);

@@ -23,6 +23,27 @@ async function parseResponse(payload: Bytes): Promise<RCPMessage> {
 const validPayload = Bytes.from([1, 2, 3, RadioLibrary.RAIL, 4, 5, 6, 1, 0b1]);
 
 describe("GetFirmwareInfoResponse", () => {
+	test.each(Array.from({ length: 8 }, (_, length) => length))(
+		"rejects a response with only %i fixed bytes",
+		async (length) => {
+			await expect(
+				parseResponse(validPayload.subarray(0, length)),
+			).rejects.toThrow();
+		},
+	);
+
+	test("rejects a truncated supported-function bitmask", async () => {
+		const payload = Bytes.from(validPayload);
+		payload[7] = 2;
+		await expect(parseResponse(payload)).rejects.toThrow();
+	});
+
+	test("accepts a complete multi-byte supported-function bitmask", async () => {
+		const payload = Bytes.concat([validPayload, [1]]);
+		payload[7] = 2;
+		const msg = (await parseResponse(payload)) as GetFirmwareInfoResponse;
+		expect(msg.supportedFunctionTypes).toStrictEqual([1, 9]);
+	});
 	test("parses both versions and the supported function types", async () => {
 		const msg = (await parseResponse(
 			validPayload,
