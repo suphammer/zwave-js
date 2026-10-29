@@ -671,6 +671,168 @@ test("a node-information request keeps its held receive path without a proactive
 	}
 });
 
+test("a sleeping peer's cross-rate NIF is received after one same-PHY request resumes hopping", async () => {
+	const fixture = await rateRecoveryFixture({
+		nodeProtocolInfo: new Map([[2, Bytes.from("539c01040701", "hex")]]),
+	});
+	const nif = Bytes.from("0101539c0107015e86725a738031713070855984", "hex");
+	let retained: number | undefined;
+	const publication = vi.fn();
+	fixture.configure.mockImplementationOnce(async () => fixture.restore);
+	fixture.transmit.mockImplementation(async (tx) => {
+		retained = tx.holdRx ? tx.channel : undefined;
+		setTimeout(() => {
+			if (retained !== undefined && retained !== 1) return;
+			fixture.receiveFrame(
+				new SinglecastZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					sequenceNumber: 2,
+					ackRequested: true,
+					speedModified: true,
+					payload: nif,
+				}),
+				{ channel: 1, protocolDataRate: ProtocolDataRate.ZWave_40k },
+			);
+		}, 200);
+		return { status: ControllerTransmitStatus.OK };
+	});
+	try {
+		const receiving = fixture.controller.requestNodeInformation(2, 5_000);
+		void receiving.then(publication);
+		await vi.advanceTimersByTimeAsync(249);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(201);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([2, 2]);
+		expect(fixture.frames().map(({ tx }) => tx.holdRx)).toEqual([
+			true,
+			false,
+		]);
+		expect(fixture.frames().every(({ tx }) => !tx.alternateRx)).toBe(true);
+		expect(
+			fixture.frames().map(({ frame }) => Array.from(frame.payload)),
+		).toEqual([
+			[1, 2],
+			[1, 2],
+		]);
+		expect(fixture.configure).toHaveBeenCalledTimes(2);
+		expect(publication).not.toHaveBeenCalled();
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.NotIdle,
+		);
+		fixture.restore.resolve();
+		expect((await receiving)?.command).toEqual(Uint8Array.from(nif));
+		expect(publication).toHaveBeenCalledTimes(1);
+		expect(
+			fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+		).toBe(true);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each([100, 500])(
+	"node-information reception retains its original %s ms deadline across RX phases",
+	async (timeoutMs) => {
+		const fixture = await rateRecoveryFixture();
+		const publication = vi.fn();
+		try {
+			const started = Date.now();
+			const receiving = fixture.controller.requestNodeInformation(
+				2,
+				timeoutMs,
+			);
+			void receiving.then(publication);
+			await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+			expect(publication).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(await receiving).toBeUndefined();
+			expect(Date.now() - started).toBe(timeoutMs);
+			expect(fixture.transmit).toHaveBeenCalledTimes(
+				timeoutMs < 250 ? 1 : 2,
+			);
+			expect(fixture.configure).toHaveBeenCalledTimes(2);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["abort", "stop", "reset", "fault"] as const)(
+	"%s during fixed node-information reception prevents a follow-up transmission",
+	async (action) => {
+		const fixture = await rateRecoveryFixture();
+		const abort = new AbortController();
+		try {
+			const receiving = fixture.controller.requestNodeInformation(
+				2,
+				5_000,
+				abort.signal,
+			);
+			await vi.advanceTimersByTimeAsync(100);
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "abort") abort.abort();
+			else if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("receive fault"));
+			expect(await receiving).toBeUndefined();
+			await cancelling;
+			await vi.advanceTimersByTimeAsync(5_000);
+			expect(fixture.transmit).toHaveBeenCalledTimes(1);
+			if (action === "stop") {
+				expect(
+					fixture.configure.mock.calls
+						.slice(1)
+						.every(([configuration]) => !configuration.autoAck),
+				).toBe(true);
+			}
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["abort", "stop", "reset", "fault"] as const)(
+	"%s during node-information RX cleanup prevents a captured NIF from being published",
+	async (action) => {
+		const fixture = await rateRecoveryFixture();
+		const abort = new AbortController();
+		const nif = Bytes.from("0101d39c0010012527", "hex");
+		fixture.configure.mockImplementationOnce(async () => fixture.restore);
+		fixture.transmit.mockImplementationOnce(async () => {
+			fixture.receiveCommand(nif);
+			return { status: ControllerTransmitStatus.OK };
+		});
+		try {
+			const receiving = fixture.controller.requestNodeInformation(
+				2,
+				5_000,
+				abort.signal,
+			);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(fixture.configure).toHaveBeenCalledTimes(2);
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "abort") abort.abort();
+			else if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("receive fault"));
+			fixture.restore.resolve();
+			expect(await receiving).toBeUndefined();
+			await cancelling;
+			expect(fixture.transmit).toHaveBeenCalledTimes(1);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
 test.each([
 	ControllerTransmitStatus.Fail,
 	ControllerTransmitStatus.NotIdle,

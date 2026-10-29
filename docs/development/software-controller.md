@@ -124,6 +124,22 @@ result cannot publish preference while the local transmit is still unresolved.
 These software guarantees require corresponding RF tests before claiming
 device-specific rate recovery or application reliability.
 
+## Node-information reception
+
+An explicit node-information request first retains RX on its existing transmit
+PHY for up to 250 ms, protecting long same-PHY NIFs. If no NIF arrives while the
+request remains active, the controller repeats only the idempotent Protocol CC
+`01 02` request on the same transmit PHY with normal receive hopping restored.
+This lets a peer answer on another Classic PHY, including an awake battery
+device whose NIF uses a different rate from its verified inclusion ACK.
+
+Both phases share one response waiter, transmit fence, and original deadline of
+at most five seconds. Cancellation, shutdown, reset, or radio fault prevents a
+follow-up request, and receiver cleanup completes before the NIF reaches the
+Driver. The operation sends at most two requests, adds no NOP or higher-rate TX
+probe, and does not change the ACK-confirmed preferred transmit channel from
+passive NIF reception or unacknowledged local transmit completion.
+
 ## End-node inclusion verification
 
 After Assign IDs, an end node's new identity is verified with an acknowledged,

@@ -38,6 +38,41 @@ test("ends an unanswered window at its deadline", async () => {
 	expect(vi.getTimerCount()).toBe(0);
 });
 
+test("a shorter receive phase leaves the original response deadline intact", async () => {
+	vi.useFakeTimers();
+	const pending = new NodeInformationRequest(2, 500);
+	const phase = pending.waitForResponse(250);
+	await vi.advanceTimersByTimeAsync(250);
+	expect(await phase).toBeUndefined();
+	expect(pending.isPending).toBe(true);
+	expect(vi.getTimerCount()).toBe(1);
+	await vi.advanceTimersByTimeAsync(250);
+	expect(await pending.response).toBeUndefined();
+	expect(pending.isPending).toBe(false);
+	expect(vi.getTimerCount()).toBe(0);
+});
+
+test("a NIF ends a receive phase and clears both timers", async () => {
+	vi.useFakeTimers();
+	const pending = new NodeInformationRequest(2, 500);
+	const phase = pending.waitForResponse(250);
+	const frame = { sourceNodeId: 2, command: Uint8Array.of(1, 1) };
+	pending.accept(frame);
+	expect(await phase).toEqual(frame);
+	expect(pending.isPending).toBe(false);
+	expect(vi.getTimerCount()).toBe(0);
+});
+
+test("the original deadline ends a longer receive phase without a new window", async () => {
+	vi.useFakeTimers();
+	const pending = new NodeInformationRequest(2, 100);
+	const phase = pending.waitForResponse(250);
+	await vi.advanceTimersByTimeAsync(100);
+	expect(await phase).toBeUndefined();
+	expect(pending.isPending).toBe(false);
+	expect(vi.getTimerCount()).toBe(0);
+});
+
 test("cancellation releases timers and keeps late NIFs owned through cleanup", async () => {
 	vi.useFakeTimers();
 	const abort = new AbortController();

@@ -37,6 +37,25 @@ export class NodeInformationRequest {
 		if (signal?.aborted) this.cancel();
 	}
 
+	public get isPending(): boolean {
+		return !this.#settled;
+	}
+
+	public async waitForResponse(
+		timeoutMs: number,
+	): Promise<ControllerApplicationFrame | undefined> {
+		let timer!: ReturnType<typeof setTimeout>;
+		const elapsed = new Promise<undefined>((resolve) => {
+			timer = setTimeout(() => resolve(undefined), timeoutMs);
+			timer.unref();
+		});
+		try {
+			return await Promise.race([this.response, elapsed]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
 	public accept(frame: ControllerApplicationFrame): boolean {
 		if (
 			frame.sourceNodeId !== this.nodeId

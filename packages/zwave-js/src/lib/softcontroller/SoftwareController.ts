@@ -78,6 +78,7 @@ const BEAM_MODE_LONG: SoftwareControllerBeamMode = "1000ms";
 const FLIRS_AWAKE_HOLD_MS = 2_000;
 const FLIRS_AWAKE_TX_GUARD_MS = 500;
 const DATA_RATE_RECOVERY_COOLDOWN_MS = 60_000;
+const NODE_INFORMATION_FIXED_RX_MS = 250;
 const TRANSMIT_OPTION_ACK = 0x01;
 const TRANSMIT_OPTION_EXPLORE = 0x20;
 const CLASSIC_NODE_ID_MAX = 232;
@@ -1185,7 +1186,8 @@ export class SoftwareController implements RawControllerTransport {
 		const operation = this.#requestNodeInformation(pending);
 		this.#activeSend = operation;
 		try {
-			return await operation;
+			const frame = await operation;
+			return signal?.aborted ? undefined : frame;
 		} finally {
 			this.#sendInFlight = false;
 			if (this.#activeSend === operation) this.#activeSend = undefined;
@@ -1195,19 +1197,33 @@ export class SoftwareController implements RawControllerTransport {
 	async #requestNodeInformation(
 		pending: NodeInformationRequest,
 	): Promise<ControllerApplicationFrame | undefined> {
+		const epoch = this.#networkStateEpoch;
 		let frame: ControllerApplicationFrame | undefined;
 		let failure: { error: unknown } | undefined;
 		try {
-			const result = await this.#sendAcrossClassicChannels(
-				{
-					destinationNodeId: pending.nodeId,
-					command: Uint8Array.of(0x01, 0x02),
-					transmitOptions: 0,
-				},
-				true,
-			);
-			if (result.status === ControllerTransmitStatus.OK)
-				frame = await pending.response;
+			const request = {
+				destinationNodeId: pending.nodeId,
+				command: Uint8Array.of(0x01, 0x02),
+				transmitOptions: 0,
+			};
+			const result = await this.#sendAcrossClassicChannels(request, true);
+			if (result.status === ControllerTransmitStatus.OK) {
+				frame = await pending.waitForResponse(
+					NODE_INFORMATION_FIXED_RX_MS,
+				);
+				if (
+					!frame
+					&& pending.isPending
+					&& this.#canContinueSend(epoch)
+				) {
+					// A peer may answer on another PHY. Repeating only this idempotent
+					// request resumes hopping without abandoning long same-PHY NIFs.
+					const retry =
+						await this.#sendAcrossClassicChannels(request);
+					if (retry.status === ControllerTransmitStatus.OK)
+						frame = await pending.response;
+				}
+			}
 		} catch (error) {
 			failure = { error };
 		}
@@ -1217,7 +1233,10 @@ export class SoftwareController implements RawControllerTransport {
 			// and the operation fence can release its next interview command.
 			await this.#configure(
 				this.#radio,
-				!this.#started || this.#faulted || this.#factoryDefaultOperation
+				!this.#started
+					|| this.#faulted
+					|| this.#stopOperation
+					|| this.#factoryDefaultOperation
 					? "disabled"
 					: "network",
 			);
@@ -1235,6 +1254,7 @@ export class SoftwareController implements RawControllerTransport {
 				this.#nodeInformationRequest = undefined;
 		}
 		if (failure) throw failure.error;
+		if (!this.#canContinueSend(epoch)) return;
 		return frame;
 	}
 
