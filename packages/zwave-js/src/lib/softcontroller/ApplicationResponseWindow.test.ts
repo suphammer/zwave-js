@@ -46,11 +46,11 @@ test("restores an unanswered idle lease once after the bounded window", async ()
 	const expire = vi.fn();
 	const window = new ApplicationResponseWindow(expire);
 	window.retain();
-	await vi.advanceTimersByTimeAsync(APPLICATION_RESPONSE_WINDOW_MS - 1);
+	await vi.advanceTimersByTimeAsync(999);
 	expect(expire).not.toHaveBeenCalled();
 	await vi.advanceTimersByTimeAsync(1);
 	expect(expire).toHaveBeenCalledOnce();
-	await vi.advanceTimersByTimeAsync(APPLICATION_RESPONSE_WINDOW_MS);
+	await vi.advanceTimersByTimeAsync(1_000);
 	expect(expire).toHaveBeenCalledOnce();
 	expect(vi.getTimerCount()).toBe(0);
 });

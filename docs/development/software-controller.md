@@ -44,7 +44,7 @@ invented device capabilities or routes.
 
 Ordinary acknowledged direct application traffic retains reception on its
 transmit channel atomically when the radio finishes the MAC transaction. A
-successful transmit starts a bounded 250 ms idle response window; reports are
+successful transmit starts a bounded 1000 ms idle response window; reports are
 forwarded immediately and do not end it early. The transmit callback still
 reports MAC completion, without waiting for or inventing an application reply.
 A new transmit or MAC configuration supersedes the idle window without first
@@ -55,6 +55,14 @@ application send or Request Node Information waits for that restoration and then
 lifecycle, network-management, and transmit ownership. A genuine active transmit
 still returns `NotIdle`; waiting does not bypass its fence. Restoration failure
 fails the waiting command without transmitting.
+
+The window follows the Driver's default base `timeouts.report` value of 1000 ms.
+The Driver can wait longer after adding command RTT or applying per-message,
+device-compatibility, or safe-mode overrides; this fixed receive window does not
+follow those extensions. A 2026-10-29 lab capture showed a valid 9.6 kbit/s
+Fibaro Meter Report about 322 ms after its ACK, beyond the former 250 ms receive
+window. The one-second bound covers that measured delay; device response timing
+still requires matching RF evidence after deployment.
 
 Failed held transmissions restore reception before releasing the fence.
 Management, reset, stop, and radio faults cancel stale deadlines; stop waits for

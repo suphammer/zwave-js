@@ -5,7 +5,7 @@
 
 import type { BytesView } from "@zwave-js/shared";
 
-export const APPLICATION_RESPONSE_WINDOW_MS = 250;
+export const APPLICATION_RESPONSE_WINDOW_MS = 1_000;
 
 export function shouldHoldApplicationResponse(
 	command: BytesView,

@@ -365,6 +365,69 @@ async function responseRestoreFixture(
 	};
 }
 
+test("a 350 ms Meter Report survives retained RX, and a new TX supersedes its one-second deadline", async () => {
+	const fixture = await responseRestoreFixture({
+		channel: 2,
+		nodeChannels: new Map([[2, 2]]),
+		nodeProtocolInfo: new Map([[2, Bytes.from("d39c00041001", "hex")]]),
+	});
+	let retainedRx = false;
+	const received: ControllerApplicationFrame[] = [];
+	fixture.configure.mockImplementation(async () => {
+		retainedRx = false;
+	});
+	fixture.transmit.mockImplementation(async (request) => {
+		retainedRx = request.holdRx;
+		return { status: ControllerTransmitStatus.OK };
+	});
+	fixture.onFrame((frame) => received.push(frame));
+	const request = {
+		...fixture.request,
+		command: Bytes.from([0x32, 0x01, 0x00]),
+	};
+	try {
+		// Send completes on the ACK, while RX remains available for a later report.
+		expect((await fixture.controller.send(request)).status).toBe(
+			ControllerTransmitStatus.OK,
+		);
+		await vi.advanceTimersByTimeAsync(350);
+		const report = Bytes.from([0x32, 0x02, 0x21, 0x11, 0x00, 0x00, 0x00]);
+		if (retainedRx) {
+			fixture.receiveFrame(
+				new SinglecastZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					ackRequested: false,
+					sequenceNumber: 2,
+					speedModified: true,
+					payload: report,
+				}),
+				{ channel: 2, protocolDataRate: ProtocolDataRate.ZWave_9k6 },
+			);
+		}
+		expect(received).toHaveLength(1);
+		expect(Array.from(received[0].command)).toEqual(Array.from(report));
+		expect(fixture.configure).toHaveBeenCalledTimes(1);
+		// The idle window owns no transmit fence and introduces no retune gap.
+		expect((await fixture.controller.send(request)).status).toBe(
+			ControllerTransmitStatus.OK,
+		);
+		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+		expect(fixture.configure).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(650);
+		expect(retainedRx).toBe(true);
+		expect(fixture.configure).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(349);
+		expect(retainedRx).toBe(true);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(retainedRx).toBe(false);
+		expect(fixture.configure).toHaveBeenCalledTimes(2);
+	} finally {
+		await fixture.close();
+	}
+});
+
 test("a delayed application response waits for internal RX restoration before its next send", async () => {
 	const fixture = await responseRestoreFixture();
 	try {
