@@ -46,12 +46,14 @@ test("holds the shared database lock until backend destruction", async () => {
 		const backend = await createSoftwareControllerDriverBackend(
 			options(directory),
 		);
+		expect(backend.firmwareInfo).toBeUndefined();
 		await expect(
 			createSoftwareControllerDriverBackend(options(directory)),
 		).rejects.toThrow("Failed to lock DB file");
 		const closing = backend.destroy();
 		expect(backend.destroy()).toBe(closing);
 		await closing;
+		expect(backend.firmwareInfo).toBeUndefined();
 		const reopened = await createSoftwareControllerDriverBackend({
 			...options(directory),
 			homeId: 0xcdab_1234,

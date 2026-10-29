@@ -1,5 +1,7 @@
 import type { ZWaveSerialBindingFactory } from "@zwave-js/serial";
 
+import type { ControllerFirmwareInfo } from "./ControllerFirmwareInfo.js";
+
 /** Capabilities of an in-process controller implementation. */
 export interface ControllerBackendCapabilities {
 	readonly networkWideInclusion: boolean;
@@ -12,5 +14,6 @@ export interface ControllerBackendCapabilities {
 export interface NativeControllerBackend {
 	readonly binding: ZWaveSerialBindingFactory;
 	readonly capabilities: ControllerBackendCapabilities;
+	readonly firmwareInfo?: ControllerFirmwareInfo;
 	destroy(): Promise<void>;
 }

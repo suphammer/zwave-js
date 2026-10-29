@@ -9,6 +9,7 @@ import { ZWaveError, ZWaveErrorCodes, type RFRegion } from "@zwave-js/core";
 import type { ZWaveSerialBinding } from "@zwave-js/serial";
 import type { DatabaseOptions } from "@zwave-js/shared/bindings";
 
+import type { ControllerFirmwareInfo } from "../driver/ControllerFirmwareInfo.js";
 import type { NativeControllerBackend } from "../driver/NativeControllerBackend.js";
 import type { ZWaveOptions } from "../driver/ZWaveOptions.js";
 
@@ -41,6 +42,7 @@ export interface SoftwareControllerDriverBackendOptions {
 
 interface ActiveController {
 	close(): Promise<void>;
+	readonly firmwareInfo?: ControllerFirmwareInfo;
 }
 
 /** Owns a software controller and its database for the lifetime of one Driver. */
@@ -185,7 +187,12 @@ export async function createSoftwareControllerDriverBackend(
 			}
 			assertAvailable();
 		}
-		active = { close };
+		active = {
+			close,
+			get firmwareInfo() {
+				return stopping ? undefined : transport.firmwareInfo;
+			},
+		};
 		const binding: ZWaveSerialBinding = {
 			sink: {
 				...original.sink,
@@ -215,6 +222,9 @@ export async function createSoftwareControllerDriverBackend(
 		return binding;
 	};
 	return {
+		get firmwareInfo() {
+			return destroyed ? undefined : active?.firmwareInfo;
+		},
 		capabilities: {
 			networkWideInclusion: false,
 			highPower: false,

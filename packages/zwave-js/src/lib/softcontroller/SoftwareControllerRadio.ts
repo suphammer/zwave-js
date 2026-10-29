@@ -11,6 +11,8 @@ import type {
 } from "@zwave-js/core";
 import type { BytesView } from "@zwave-js/shared";
 
+import type { ControllerFirmwareInfo } from "../driver/ControllerFirmwareInfo.js";
+
 import type {
 	ControllerIdentity,
 	ControllerTransmitStatus,
@@ -74,6 +76,7 @@ export interface SoftwareControllerMPDURxInfo {
  */
 export interface SoftwareControllerRadio {
 	readonly capabilities: SoftwareControllerRadioCapabilities;
+	readonly firmwareInfo?: ControllerFirmwareInfo;
 	readonly limits: {
 		maximumMPDUSize: number;
 		/** Zero when the radio cannot perform an atomic beam/MPDU operation. */

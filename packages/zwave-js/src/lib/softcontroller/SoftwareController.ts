@@ -27,6 +27,8 @@ import {
 } from "@zwave-js/core";
 import { Bytes, type BytesView } from "@zwave-js/shared";
 
+import type { ControllerFirmwareInfo } from "../driver/ControllerFirmwareInfo.js";
+
 import {
 	ControllerTransmitStatus,
 	type ControllerApplicationFrame,
@@ -960,6 +962,12 @@ export class SoftwareController implements RawControllerTransport {
 			]),
 			transmitOptions: TRANSMIT_OPTION_ACK,
 		});
+	}
+
+	public get firmwareInfo(): ControllerFirmwareInfo | undefined {
+		if (!this.#started || this.#faulted) return undefined;
+		const info = this.#radio.firmwareInfo;
+		return info ? { ...info } : undefined;
 	}
 
 	public async start(

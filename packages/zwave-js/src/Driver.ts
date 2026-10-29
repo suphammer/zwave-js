@@ -22,6 +22,7 @@ export type {
 	ControllerOptions,
 	SuphacapControllerOptions,
 } from "./lib/driver/ControllerOptions.js";
+export type { ControllerFirmwareInfo } from "./lib/driver/ControllerFirmwareInfo.js";
 export * from "./lib/driver/DriverMode.js";
 export type {
 	EditableZWaveOptions,

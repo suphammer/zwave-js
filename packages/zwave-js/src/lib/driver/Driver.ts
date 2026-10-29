@@ -257,6 +257,7 @@ import {
 } from "../telemetry/statistics.js";
 
 import { Bootloader } from "./Bootloader.js";
+import type { ControllerFirmwareInfo } from "./ControllerFirmwareInfo.js";
 import { validateControllerOptions } from "./ControllerOptions.js";
 import { DriverMode } from "./DriverMode.js";
 import { EndDeviceCLI } from "./EndDeviceCLI.js";
@@ -949,6 +950,13 @@ export class Driver
 	private nativeControllerBackend:
 		| Promise<NativeControllerBackend>
 		| undefined;
+	private _controllerBackend: NativeControllerBackend | undefined;
+	/** Live firmware metadata for the local controller, separate from its Z-Wave SDK. */
+	public get controllerFirmwareInfo(): ControllerFirmwareInfo | undefined {
+		if (this.wasDestroyed) return undefined;
+		const info = this._controllerBackend?.firmwareInfo;
+		return info ? { ...info } : undefined;
+	}
 	private _controllerBackendCapabilities:
 		| ControllerBackendCapabilities
 		| undefined;
@@ -1732,6 +1740,7 @@ export class Driver
 					);
 				}
 				this._controllerBackendCapabilities = backend.capabilities;
+				this._controllerBackend = backend;
 				binding = backend.binding;
 			} catch (error) {
 				await this.destroy();

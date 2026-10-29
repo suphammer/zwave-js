@@ -408,6 +408,25 @@ Once the `"driver ready"` event was emitted, this property provides access to th
 > [!WARNING]
 > Don't use it before the driver is ready!
 
+### `controllerFirmwareInfo`
+
+```ts
+readonly controllerFirmwareInfo: ControllerFirmwareInfo | undefined
+```
+
+Returns a detached snapshot of the local backend's reported firmware and display
+identity. The fields are `manufacturer`, `product`, `firmwareVersion`, and
+`firmwareLabel`, with optional `firmwareProfile`, `minimumVersion`, and
+`recommendedVersion`. Versions use `x.y.z` notation. The recommendation is the
+firmware baseline selected by this Driver backend, not an online check for the
+latest release.
+
+The property is `undefined` before firmware discovery, after the backend stops,
+or when the backend does not supply metadata. Existing Serial API controllers
+continue to expose their firmware through the controller and node APIs. This
+metadata describes only the local controller; it does not replace Z-Wave SDK
+versions, assign numeric manufacturer/product IDs, or identify other nodes.
+
 ### `configManager`
 
 ```ts
