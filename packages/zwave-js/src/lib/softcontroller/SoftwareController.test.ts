@@ -4,10 +4,15 @@
  */
 
 import {
+	AckZWaveMPDU,
 	ChannelConfiguration,
+	ExplorerFrameCommand,
 	MPDU,
+	MPDUHeaderType,
+	NormalExplorerZWaveMPDU,
 	ProtocolDataRate,
 	RFRegion,
+	SearchResultExplorerZWaveMPDU,
 	RoutedZWaveMPDU,
 	SinglecastZWaveMPDU,
 } from "@zwave-js/core";
@@ -30,10 +35,12 @@ import {
 	normalizeInclusionChannel,
 	SoftwareController,
 	type SoftwareControllerOptions,
+	type SoftwareControllerState,
 } from "./SoftwareController.js";
 import type {
 	SoftwareControllerMPDURxInfo,
 	SoftwareControllerRadio,
+	SoftwareControllerRegionConfig,
 } from "./SoftwareControllerRadio.js";
 
 afterEach(() => vi.useRealTimers());
@@ -243,12 +250,14 @@ test.each([
 
 async function responseRestoreFixture(
 	options: Partial<SoftwareControllerOptions> = {},
+	radioChannels?: SoftwareControllerRegionConfig["channels"],
 ) {
 	vi.useFakeTimers();
 	const homeId = options.homeId ?? 0x12345678;
 	const region = options.region ?? RFRegion.Europe;
 	const channels =
-		region === RFRegion.Japan
+		radioChannels
+		?? (region === RFRegion.Japan
 			? [922500000, 923900000, 926300000].map((frequency, channel) => ({
 					channel,
 					frequency,
@@ -270,11 +279,12 @@ async function responseRestoreFixture(
 						frequency: 868400000,
 						dataRate: ProtocolDataRate.ZWave_9k6,
 					},
-				];
+				]);
 	const restore = createDeferredPromise<void>();
 	void restore.catch(() => undefined);
 	const errors: unknown[] = [];
 	let receive!: Parameters<SoftwareControllerRadio["start"]>[0];
+	let radioError!: Parameters<SoftwareControllerRadio["start"]>[1];
 	let onFrame: ((frame: ControllerApplicationFrame) => void) | undefined;
 	const transmit = vi.fn<SoftwareControllerRadio["transmit"]>(async () => ({
 		status: ControllerTransmitStatus.OK,
@@ -293,8 +303,9 @@ async function responseRestoreFixture(
 			foreignHomeIdAcknowledgement: true,
 		},
 		limits: { maximumMPDUSize: 64, maximumBeamMPDUSize: 0 },
-		start: async (callback) => {
+		start: async (callback, onError) => {
 			receive = callback;
+			radioError = onError;
 			return {
 				region,
 				channelConfig: ChannelConfiguration.Classic,
@@ -337,6 +348,9 @@ async function responseRestoreFixture(
 		);
 	return {
 		controller,
+		channels,
+		radio,
+		radioError: (error: unknown) => radioError(error),
 		request,
 		restore,
 		errors,
@@ -365,20 +379,582 @@ async function responseRestoreFixture(
 	};
 }
 
+async function rateRecoveryFixture(
+	options: Partial<SoftwareControllerOptions> = {},
+	channels?: SoftwareControllerRegionConfig["channels"],
+) {
+	const saved: SoftwareControllerState[] = [];
+	const fixture = await responseRestoreFixture(
+		{
+			channel: 2,
+			maxAttempts: 3,
+			nodeChannels: new Map([[2, 2]]),
+			nodeProtocolInfo: new Map([[2, Bytes.from("d39c01041001", "hex")]]),
+			onControllerStateChanged: (state) => {
+				saved.push(state);
+			},
+			...options,
+		},
+		channels,
+	);
+	const frames = () =>
+		fixture.transmit.mock.calls.map(([tx]) => ({
+			tx,
+			frame: MPDU.parse(tx.mpdu, {
+				region: RFRegion.Europe,
+				channel: tx.channel,
+				protocolDataRate: fixture.channels.find(
+					({ channel }) => channel === tx.channel,
+				)!.dataRate,
+			}),
+		}));
+	return { ...fixture, saved, frames };
+}
+
+test("failed 100 kbit/s recovery followed by an ACKed 40 kbit/s NOP sends DATA exactly once and retains TX preference across slower RX", async () => {
+	const fixture = await rateRecoveryFixture();
+	const probe = createDeferredPromise<{ status: ControllerTransmitStatus }>();
+	fixture.transmit.mockImplementation(async (tx) => {
+		if (tx.channel === 0) return { status: ControllerTransmitStatus.NoAck };
+		if (fixture.transmit.mock.calls.length === 2) return probe;
+		return { status: ControllerTransmitStatus.OK };
+	});
+	try {
+		const sending = fixture.controller.send(fixture.request);
+		await vi.waitFor(() =>
+			expect(fixture.transmit).toHaveBeenCalledTimes(2),
+		);
+		expect(
+			fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+		).toBe(true);
+		probe.resolve({ status: ControllerTransmitStatus.OK });
+		expect((await sending).status).toBe(ControllerTransmitStatus.OK);
+		const frames = fixture.frames();
+		expect(frames.map(({ tx }) => tx.channel)).toEqual([0, 1, 1]);
+		expect(frames.map(({ frame }) => Array.from(frame.payload))).toEqual([
+			[0],
+			[0],
+			Array.from(fixture.request.command),
+		]);
+		expect(frames.map(({ tx }) => tx.maxAttempts)).toEqual([1, 1, 3]);
+		expect(frames.map(({ tx }) => tx.holdRx)).toEqual([false, false, true]);
+		for (const { frame } of frames) {
+			expect(frame).toBeInstanceOf(SinglecastZWaveMPDU);
+			expect(frame.ackRequested).toBe(true);
+		}
+		expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(1);
+		const slowInfo = {
+			channel: 2,
+			protocolDataRate: ProtocolDataRate.ZWave_9k6,
+		};
+		fixture.receiveFrame(
+			new AckZWaveMPDU({
+				homeId: 0x12345678,
+				sourceNodeId: 2,
+				destinationNodeId: 1,
+				sequenceNumber: 15,
+				speedModified: false,
+				payload: new Bytes(),
+			}),
+			slowInfo,
+		);
+		for (const payload of [
+			Bytes.from([0x25, 0x03, 0xff]),
+			Bytes.from("0101d39c0110012527", "hex"),
+		]) {
+			fixture.receiveFrame(
+				new SinglecastZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					sequenceNumber: 14,
+					speedModified: false,
+					ackRequested: false,
+					payload,
+				}),
+				slowInfo,
+			);
+		}
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.OK,
+		);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([
+			0, 1, 1, 1,
+		]);
+		expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(1);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("all faster NOPs may fail without duplicating DATA; recovery retries only after 60 seconds", async () => {
+	const fixture = await rateRecoveryFixture();
+	let fasterWorks = false;
+	fixture.transmit.mockImplementation(async (tx) => {
+		if (tx.channel === 0 && !fasterWorks) {
+			fixture.receiveFrame(
+				new AckZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					sequenceNumber: 15,
+					speedModified: false,
+					payload: new Bytes(),
+				}),
+				{ channel: 0, protocolDataRate: ProtocolDataRate.ZWave_100k },
+			);
+		}
+		return {
+			status:
+				tx.channel === 2 || fasterWorks
+					? ControllerTransmitStatus.OK
+					: ControllerTransmitStatus.NoAck,
+		};
+	});
+	try {
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.OK,
+		);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([0, 1, 2]);
+		expect(
+			fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+		).toBe(true);
+		await vi.advanceTimersByTimeAsync(59_999);
+		fasterWorks = true;
+		await fixture.controller.send(fixture.request);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([
+			0, 1, 2, 2,
+		]);
+		await vi.advanceTimersByTimeAsync(1);
+		await fixture.controller.send(fixture.request);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([
+			0, 1, 2, 2, 0, 0,
+		]);
+		expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(0);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("a caller NOP reuses an acknowledged faster probe instead of sending another NOP", async () => {
+	const fixture = await rateRecoveryFixture();
+	try {
+		const result = await fixture.controller.send({
+			...fixture.request,
+			command: Bytes.from([0]),
+		});
+		expect(result.status).toBe(ControllerTransmitStatus.OK);
+		expect(result.txReport?.txChannelNo).toBe(0);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() =>
+			expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(0),
+		);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("an ACKed faster NOP followed by DATA NoAck never replays DATA at the previous rate", async () => {
+	const fixture = await rateRecoveryFixture();
+	fixture.transmit.mockResolvedValueOnce({
+		status: ControllerTransmitStatus.OK,
+	});
+	fixture.transmit.mockResolvedValue({
+		status: ControllerTransmitStatus.NoAck,
+	});
+	try {
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.NoAck,
+		);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([0, 0]);
+		expect(
+			fixture.frames().map(({ frame }) => Array.from(frame.payload)),
+		).toEqual([[0], Array.from(fixture.request.command)]);
+		expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(0);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("a second distinct 100 kbit/s physical profile can recover after the first misses its ACK", async () => {
+	const fixture = await rateRecoveryFixture(
+		{ channel: 7, nodeChannels: new Map([[2, 7]]) },
+		[
+			{
+				channel: 2,
+				frequency: 869850000,
+				dataRate: ProtocolDataRate.ZWave_100k,
+			},
+			{
+				channel: 3,
+				frequency: 868400000,
+				dataRate: ProtocolDataRate.ZWave_100k,
+			},
+			{
+				channel: 7,
+				frequency: 868400000,
+				dataRate: ProtocolDataRate.ZWave_9k6,
+			},
+		],
+	);
+	fixture.transmit.mockImplementation(async (tx) => ({
+		status:
+			tx.channel === 2
+				? ControllerTransmitStatus.NoAck
+				: ControllerTransmitStatus.OK,
+	}));
+	try {
+		await fixture.controller.send(fixture.request);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([2, 3, 3]);
+		expect(
+			fixture.frames().map(({ frame }) => Array.from(frame.payload)),
+		).toEqual([[0], [0], Array.from(fixture.request.command)]);
+		expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(3);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("FLiRS stays on its atomic 40 kbit/s path, including the already-awake follow-up", async () => {
+	const fixture = await rateRecoveryFixture({
+		nodeProtocolInfo: new Map([[2, Bytes.from("d3bc01041001", "hex")]]),
+	});
+	fixture.radio.capabilities.beamTx = true;
+	fixture.radio.limits.maximumBeamMPDUSize = 64;
+	try {
+		await fixture.controller.send(fixture.request);
+		await fixture.controller.send(fixture.request);
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([1, 1]);
+		expect(fixture.frames().map(({ tx }) => tx.beamMode)).toEqual([
+			"250ms",
+			undefined,
+		]);
+		expect(
+			fixture.frames().map(({ frame }) => Array.from(frame.payload)),
+		).toEqual([
+			Array.from(fixture.request.command),
+			Array.from(fixture.request.command),
+		]);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("a node-information request keeps its held receive path without a proactive NOP", async () => {
+	const fixture = await rateRecoveryFixture();
+	fixture.transmit.mockImplementation(async () => {
+		fixture.receiveFrame(
+			new SinglecastZWaveMPDU({
+				homeId: 0x12345678,
+				sourceNodeId: 2,
+				destinationNodeId: 1,
+				sequenceNumber: 2,
+				ackRequested: false,
+				speedModified: false,
+				payload: Bytes.from("0101d39c0110012527", "hex"),
+			}),
+			{ channel: 2, protocolDataRate: ProtocolDataRate.ZWave_9k6 },
+		);
+		return { status: ControllerTransmitStatus.OK };
+	});
+	try {
+		expect(
+			await fixture.controller.requestNodeInformation(2, 5_000),
+		).toBeDefined();
+		expect(fixture.frames().map(({ tx }) => tx.channel)).toEqual([2]);
+		expect(fixture.frames()[0].tx.holdRx).toBe(true);
+		expect(
+			fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+		).toBe(true);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each([
+	ControllerTransmitStatus.Fail,
+	ControllerTransmitStatus.NotIdle,
+	ControllerTransmitStatus.NoRoute,
+	"throw",
+] as const)(
+	"a fatal rate probe %s aborts DATA without committing a faster PHY",
+	async (status) => {
+		const fixture = await rateRecoveryFixture();
+		fixture.transmit.mockImplementation(async () => {
+			if (status === "throw") throw new Error("radio failed");
+			return { status };
+		});
+		try {
+			expect(
+				(await fixture.controller.send(fixture.request)).status,
+			).toBe(status === "throw" ? ControllerTransmitStatus.Fail : status);
+			expect(
+				fixture.frames().map(({ frame }) => Array.from(frame.payload)),
+			).toEqual([[0]]);
+			expect(
+				fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+			).toBe(true);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["stop", "reset", "fault"] as const)(
+	"%s during a pending faster probe prevents DATA and PHY publication",
+	async (action) => {
+		const fixture = await rateRecoveryFixture();
+		const probe = createDeferredPromise<{
+			status: ControllerTransmitStatus;
+		}>();
+		fixture.transmit.mockImplementationOnce(async () => probe);
+		try {
+			const sending = fixture.controller.send(fixture.request);
+			expect(fixture.transmit).toHaveBeenCalledTimes(1);
+			expect(
+				(await fixture.controller.send(fixture.request)).status,
+			).toBe(ControllerTransmitStatus.NotIdle);
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("receive fault"));
+			probe.resolve({ status: ControllerTransmitStatus.OK });
+			expect((await sending).status).toBe(ControllerTransmitStatus.Fail);
+			await cancelling;
+			expect(
+				fixture.frames().map(({ frame }) => Array.from(frame.payload)),
+			).toEqual([[0]]);
+			expect(
+				fixture.saved.some((state) => state.nodeChannels.get(2) === 0),
+			).toBe(false);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["stop", "reset", "fault"] as const)(
+	"%s during a known-PHY NOP prevents later NoAck fallback transmissions",
+	async (action) => {
+		const fixture = await rateRecoveryFixture({
+			nodeProtocolInfo: new Map(),
+		});
+		const terminal = createDeferredPromise<{
+			status: ControllerTransmitStatus;
+		}>();
+		fixture.transmit.mockImplementationOnce(async () => terminal);
+		try {
+			const sending = fixture.controller.send({
+				...fixture.request,
+				command: Bytes.from([0]),
+				transmitOptions: 0x21,
+			});
+			expect(fixture.transmit).toHaveBeenCalledTimes(1);
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("receive fault"));
+			terminal.resolve({ status: ControllerTransmitStatus.NoAck });
+			expect((await sending).status).toBe(ControllerTransmitStatus.Fail);
+			await cancelling;
+			expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("a send started immediately after shutdown begins cannot submit recovery probes", async () => {
+	const fixture = await rateRecoveryFixture();
+	try {
+		const stopping = fixture.controller.stop();
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.Fail,
+		);
+		await stopping;
+		expect(fixture.transmit).not.toHaveBeenCalled();
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each([
+	{
+		kind: "unknown peer",
+		options: {
+			includedNodeIds: [1],
+			nodeChannels: new Map(),
+			nodeProtocolInfo: new Map(),
+		},
+	},
+	{ kind: "missing NIF", options: { nodeProtocolInfo: new Map() } },
+	{ kind: "missing PHY", options: { nodeChannels: new Map() } },
+	{
+		kind: "sleeping peer",
+		options: {
+			nodeProtocolInfo: new Map([[2, Bytes.from("539c01041001", "hex")]]),
+		},
+	},
+	{
+		kind: "routed peer",
+		options: { includedNodeIds: [1, 2, 3], routes: new Map([[2, [3]]]) },
+	},
+] as const)("does not proactively probe a $kind", async ({ options }) => {
+	const fixture = await rateRecoveryFixture(options);
+	try {
+		await fixture.controller.send(fixture.request);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		expect(fixture.frames()[0].frame.payload).toEqual(
+			fixture.request.command,
+		);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each([0x01, 0x55, 0x98, 0x9f])(
+	"timing-critical CC 0x%s bypasses proactive rate probes",
+	async (cc) => {
+		const fixture = await rateRecoveryFixture();
+		try {
+			await fixture.controller.send({
+				...fixture.request,
+				command: Bytes.from([cc, 1]),
+			});
+			expect(fixture.transmit).toHaveBeenCalledTimes(1);
+			expect(fixture.frames()[0].tx.channel).toBe(2);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("unacknowledged local TX completion neither probes nor publishes an unknown preferred PHY", async () => {
+	const fixture = await rateRecoveryFixture({ nodeChannels: new Map() });
+	try {
+		await fixture.controller.send({
+			...fixture.request,
+			transmitOptions: 0,
+		});
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		expect(fixture.saved.every((state) => !state.nodeChannels.has(2))).toBe(
+			true,
+		);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each(["success", "wire failure", "invalid route", "stop"] as const)(
+	"Explorer preference waits for terminal TX and a valid correlated result: %s",
+	async (outcome) => {
+		const fixture = await rateRecoveryFixture({
+			nodeChannels: new Map(),
+			nodeProtocolInfo: new Map(),
+		});
+		fixture.radio.capabilities.explorerTx = true;
+		const terminal = createDeferredPromise<{
+			status: ControllerTransmitStatus;
+		}>();
+		let replied = false;
+		fixture.transmit.mockImplementation(async (tx) => {
+			const frame = MPDU.parse(tx.mpdu, {
+				region: RFRegion.Europe,
+				channel: tx.channel,
+				protocolDataRate: fixture.channels.find(
+					({ channel }) => channel === tx.channel,
+				)!.dataRate,
+			});
+			if (!(frame instanceof NormalExplorerZWaveMPDU))
+				return { status: ControllerTransmitStatus.NoAck };
+			fixture.receiveFrame(
+				new SearchResultExplorerZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					ackRequested: false,
+					sequenceNumber: 7,
+					headerType: MPDUHeaderType.Explorer,
+					routed: false,
+					speedModified: false,
+					version: 1,
+					command: ExplorerFrameCommand.SearchResult,
+					stop: false,
+					sourceRouted: false,
+					direction: "inbound",
+					randomTXInterval: 0,
+					ttl: 4,
+					repeaters: [],
+					searchingNodeId: 1,
+					frameHandle: frame.sequenceNumber,
+					resultTTL: 4,
+					resultRepeaters: outcome === "invalid route" ? [1] : [],
+					payload: new Bytes(),
+				}),
+				{ channel: 1, protocolDataRate: ProtocolDataRate.ZWave_40k },
+			);
+			replied = true;
+			return terminal;
+		});
+		try {
+			const sending = fixture.controller.send({
+				...fixture.request,
+				command: Bytes.from([0]),
+				transmitOptions: 0x21,
+			});
+			await vi.waitFor(() => expect(replied).toBe(true));
+			expect(
+				fixture.saved.every((state) => !state.nodeChannels.has(2)),
+			).toBe(true);
+			const stopping =
+				outcome === "stop" ? fixture.controller.stop() : undefined;
+			terminal.resolve({
+				status:
+					outcome === "wire failure"
+						? ControllerTransmitStatus.Fail
+						: ControllerTransmitStatus.OK,
+			});
+			const result = await sending;
+			if (outcome === "success") {
+				expect(result.status).toBe(ControllerTransmitStatus.OK);
+				await vi.waitFor(() =>
+					expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(2),
+				);
+				expect(result.txReport?.txChannelNo).toBe(2);
+			} else {
+				expect(result.status).not.toBe(ControllerTransmitStatus.OK);
+				expect(
+					fixture.saved.every((state) => !state.nodeChannels.has(2)),
+				).toBe(true);
+			}
+			await stopping;
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
 test("a 350 ms Meter Report survives retained RX, and a new TX supersedes its one-second deadline", async () => {
 	const fixture = await responseRestoreFixture({
 		channel: 2,
 		nodeChannels: new Map([[2, 2]]),
 		nodeProtocolInfo: new Map([[2, Bytes.from("d39c00041001", "hex")]]),
 	});
-	let retainedRx = false;
+	let retainedChannel: number | undefined;
 	const received: ControllerApplicationFrame[] = [];
 	fixture.configure.mockImplementation(async () => {
-		retainedRx = false;
+		retainedChannel = undefined;
 	});
 	fixture.transmit.mockImplementation(async (request) => {
-		retainedRx = request.holdRx;
-		return { status: ControllerTransmitStatus.OK };
+		retainedChannel = request.holdRx ? request.channel : undefined;
+		return {
+			status:
+				request.channel === 2
+					? ControllerTransmitStatus.OK
+					: ControllerTransmitStatus.NoAck,
+		};
 	});
 	fixture.onFrame((frame) => received.push(frame));
 	const request = {
@@ -392,7 +968,7 @@ test("a 350 ms Meter Report survives retained RX, and a new TX supersedes its on
 		);
 		await vi.advanceTimersByTimeAsync(350);
 		const report = Bytes.from([0x32, 0x02, 0x21, 0x11, 0x00, 0x00, 0x00]);
-		if (retainedRx) {
+		if (retainedChannel === 2) {
 			fixture.receiveFrame(
 				new SinglecastZWaveMPDU({
 					homeId: 0x12345678,
@@ -413,15 +989,15 @@ test("a 350 ms Meter Report survives retained RX, and a new TX supersedes its on
 		expect((await fixture.controller.send(request)).status).toBe(
 			ControllerTransmitStatus.OK,
 		);
-		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+		expect(fixture.transmit).toHaveBeenCalledTimes(3);
 		expect(fixture.configure).toHaveBeenCalledTimes(1);
 		await vi.advanceTimersByTimeAsync(650);
-		expect(retainedRx).toBe(true);
+		expect(retainedChannel).toBe(2);
 		expect(fixture.configure).toHaveBeenCalledTimes(1);
 		await vi.advanceTimersByTimeAsync(349);
-		expect(retainedRx).toBe(true);
+		expect(retainedChannel).toBe(2);
 		await vi.advanceTimersByTimeAsync(1);
-		expect(retainedRx).toBe(false);
+		expect(retainedChannel).toBeUndefined();
 		expect(fixture.configure).toHaveBeenCalledTimes(2);
 	} finally {
 		await fixture.close();
@@ -469,11 +1045,17 @@ test.each([
 				? new Map([[2, Bytes.from(`${nif}041001`, "hex")]])
 				: undefined,
 		});
+		fixture.transmit.mockImplementation(async (request) => ({
+			status:
+				request.channel === channel
+					? ControllerTransmitStatus.OK
+					: ControllerTransmitStatus.NoAck,
+		}));
 		try {
 			expect(
 				(await fixture.controller.send(fixture.request)).status,
 			).toBe(ControllerTransmitStatus.OK);
-			const tx = fixture.transmit.mock.calls[0][0];
+			const tx = fixture.transmit.mock.calls.at(-1)![0];
 			const rate = [
 				ProtocolDataRate.ZWave_100k,
 				ProtocolDataRate.ZWave_40k,

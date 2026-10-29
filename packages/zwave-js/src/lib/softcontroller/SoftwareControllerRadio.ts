@@ -48,6 +48,8 @@ export interface SoftwareControllerRadioConfiguration extends ControllerIdentity
 }
 
 export interface SoftwareControllerRadioTransmitOptions {
+	/** Optional smaller or larger bounded MAC attempt budget for one transaction. */
+	maxAttempts?: 1 | 2 | 3;
 	/** Additional accepted ACK Home ID, alongside the transmitted MPDU's Home ID. */
 	acknowledgementHomeId?: number;
 }

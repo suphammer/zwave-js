@@ -4,6 +4,7 @@
  */
 
 import {
+	CommandClasses,
 	ChannelConfiguration,
 	ExplorerFrameCommand,
 	ExplorerZWaveMPDU,
@@ -51,6 +52,7 @@ import {
 } from "./ControllerBackend.js";
 import { generateRandomHomeId } from "./ControllerState.js";
 import {
+	getHigherDataRateChannels,
 	getInclusionVerificationChannels,
 	shouldSetSpeedModified,
 } from "./DataRate.js";
@@ -75,6 +77,7 @@ const BEAM_MODE_LONG: SoftwareControllerBeamMode = "1000ms";
 // Reuse that window for a burst instead of paying for a new beam per command.
 const FLIRS_AWAKE_HOLD_MS = 2_000;
 const FLIRS_AWAKE_TX_GUARD_MS = 500;
+const DATA_RATE_RECOVERY_COOLDOWN_MS = 60_000;
 const TRANSMIT_OPTION_ACK = 0x01;
 const TRANSMIT_OPTION_EXPLORE = 0x20;
 const CLASSIC_NODE_ID_MAX = 232;
@@ -114,7 +117,7 @@ export interface SoftwareControllerOptions {
 	includedNodeIds?: readonly number[];
 	/** Persisted IDs reserved after an incomplete post-assignment inclusion. */
 	quarantinedNodeIds?: readonly number[];
-	/** Last known logical channel for each included non-controller node. */
+	/** ACK-confirmed preferred transmit channel for each included non-controller node. */
 	nodeChannels?: ReadonlyMap<number, number>;
 	/** Protocol-reported directed neighbor rows. */
 	nodeNeighbors?: ReadonlyMap<number, readonly number[]>;
@@ -509,6 +512,7 @@ export class SoftwareController implements RawControllerTransport {
 	readonly #includedNodeIds: Set<number>;
 	readonly #quarantinedNodeIds = new Set<number>();
 	readonly #nodeChannels = new Map<number, number>();
+	readonly #dataRateRecoveryAfter = new Map<number, number>();
 	readonly #nodeNeighbors = new Map<number, readonly number[]>();
 	readonly #nodeProtocolInfo = new Map<number, Bytes>();
 	readonly #flirsAwakeUntil = new Map<number, number>();
@@ -662,6 +666,7 @@ export class SoftwareController implements RawControllerTransport {
 			this.#includedNodeIds.add(1);
 			this.#quarantinedNodeIds.clear();
 			this.#nodeChannels.clear();
+			this.#dataRateRecoveryAfter.clear();
 			this.#nodeNeighbors.clear();
 			this.#nodeProtocolInfo.clear();
 			this.#repeaterNodeIds.clear();
@@ -1122,9 +1127,7 @@ export class SoftwareController implements RawControllerTransport {
 			await this.#activeSend?.catch(collectError);
 			await radio.stop().catch(collectError);
 
-			// Channel learning may originate from a receive callback. Drain the
-			// serialized save queue before completing shutdown so the newest PHY
-			// snapshot cannot be lost or overtaken by an older write.
+			// Drain serialized snapshots before releasing network ownership.
 			await this.#persistenceTail;
 			if (this.#persistenceError) {
 				collectError(this.#persistenceError.error);
@@ -1143,6 +1146,7 @@ export class SoftwareController implements RawControllerTransport {
 			this.#activeSend = undefined;
 			this.#faulted = false;
 			this.#flirsAwakeUntil.clear();
+			this.#dataRateRecoveryAfter.clear();
 		}
 		if (errors.length > 0) {
 			throw new AggregateError(
@@ -1285,6 +1289,9 @@ export class SoftwareController implements RawControllerTransport {
 		holdRx = false,
 		applicationResponse = false,
 	): Promise<ControllerTransmitResult> {
+		const epoch = this.#networkStateEpoch;
+		if (!this.#canContinueSend(epoch))
+			return { status: ControllerTransmitStatus.Fail };
 		const flirsBeamMode = beamModeFromProtocolInfo(
 			this.#nodeProtocolInfo.get(request.destinationNodeId),
 		);
@@ -1331,13 +1338,77 @@ export class SoftwareController implements RawControllerTransport {
 			);
 			return { status: ControllerTransmitStatus.Fail };
 		}
-		const initialChannel =
+		let initialChannel =
 			beamChannel ?? knownChannel ?? this.#normalized.channel;
 		if (beamMode && routeCandidates.length > 0 && !selectedRoute) {
 			this.#diagnostic(
 				`Ignoring routes to FLiRS node ${request.destinationNodeId} because their final repeater cannot issue wake-up beams`,
 			);
 		}
+		if (applicationResponse && !flirsBeamMode && !selectedRoute) {
+			const higherChannels = this.#dataRateRecoveryChannels(
+				request,
+				knownChannel,
+			);
+			if (higherChannels.length > 0) {
+				this.#dataRateRecoveryAfter.set(
+					request.destinationNodeId,
+					Date.now() + DATA_RATE_RECOVERY_COOLDOWN_MS,
+				);
+				const probe = {
+					destinationNodeId: request.destinationNodeId,
+					command: Uint8Array.of(0),
+					transmitOptions: TRANSMIT_OPTION_ACK,
+				};
+				for (const channel of higherChannels) {
+					const dataRate = this.#regionConfig!.channels.find(
+						(candidate) => candidate.channel === channel,
+					)!.dataRate;
+					this.#diagnostic(
+						`Probing node ${request.destinationNodeId} at ${protocolDataRateToString(dataRate)} on logical channel ${channel}`,
+					);
+					const result = await this.#performSend(
+						probe,
+						channel,
+						this.#normalized.homeId,
+						false,
+						false,
+						null,
+						null,
+						undefined,
+						false,
+						{ maxAttempts: 1 },
+					);
+					this.#diagnostic(
+						`Node ${request.destinationNodeId} rate probe on logical channel ${channel}: ${ControllerTransmitStatus[result.status]}`,
+					);
+					if (!this.#canContinueSend(epoch)) {
+						return { status: ControllerTransmitStatus.Fail };
+					}
+					if (result.status === ControllerTransmitStatus.OK) {
+						this.#rememberAcknowledgedDirectLink(probe, result);
+						void this.#rememberNodeChannel(
+							request.destinationNodeId,
+							channel,
+						);
+						this.#diagnostic(
+							`Node ${request.destinationNodeId} confirmed ${protocolDataRateToString(dataRate)} as its preferred transmit rate`,
+						);
+						if (
+							request.command.length === 1
+							&& request.command[0] === 0
+						)
+							return result;
+						initialChannel = channel;
+						break;
+					}
+					if (result.status !== ControllerTransmitStatus.NoAck)
+						return result;
+				}
+			}
+		}
+		if (!this.#canContinueSend(epoch))
+			return { status: ControllerTransmitStatus.Fail };
 		let result = await this.#performSend(
 			request,
 			initialChannel,
@@ -1401,6 +1472,7 @@ export class SoftwareController implements RawControllerTransport {
 			if (
 				knownChannel === undefined
 				&& result.status === ControllerTransmitStatus.OK
+				&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0
 			) {
 				void this.#rememberNodeChannel(
 					request.destinationNodeId,
@@ -1415,6 +1487,8 @@ export class SoftwareController implements RawControllerTransport {
 		// without risking a duplicated application command. Never apply this
 		// fallback to a real command: a lost routed ACK is not proof that the node
 		// did not execute the command.
+		if (!this.#canContinueSend(epoch))
+			return { status: ControllerTransmitStatus.Fail };
 		for (const alternativeRoute of routeCandidates.slice(1)) {
 			result = await this.#performSend(
 				request,
@@ -1424,6 +1498,8 @@ export class SoftwareController implements RawControllerTransport {
 				false,
 				alternativeRoute,
 			);
+			if (!this.#canContinueSend(epoch))
+				return { status: ControllerTransmitStatus.Fail };
 			if (result.status === ControllerTransmitStatus.OK) {
 				this.#rememberWorkingRoute(
 					request.destinationNodeId,
@@ -1445,6 +1521,8 @@ export class SoftwareController implements RawControllerTransport {
 				false,
 				null,
 			);
+			if (!this.#canContinueSend(epoch))
+				return { status: ControllerTransmitStatus.Fail };
 			this.#rememberAcknowledgedDirectLink(request, result);
 			if (result.status !== ControllerTransmitStatus.NoAck) return result;
 		}
@@ -1466,6 +1544,8 @@ export class SoftwareController implements RawControllerTransport {
 				false,
 				null,
 			);
+			if (!this.#canContinueSend(epoch))
+				return { status: ControllerTransmitStatus.Fail };
 			if (result.status === ControllerTransmitStatus.OK) {
 				this.#rememberAcknowledgedDirectLink(request, result);
 				void this.#rememberNodeChannel(
@@ -1487,6 +1567,51 @@ export class SoftwareController implements RawControllerTransport {
 			return this.#performExplorerProbe(request, initialChannel);
 		}
 		return result;
+	}
+
+	#canContinueSend(epoch: number): boolean {
+		return (
+			this.#started
+			&& this.#regionConfig !== undefined
+			&& !this.#faulted
+			&& !this.#stopOperation
+			&& !this.#factoryDefaultOperation
+			&& !this.#networkManagementSession
+			&& this.#networkStateEpoch === epoch
+		);
+	}
+
+	#dataRateRecoveryChannels(
+		request: ControllerTransmitRequest,
+		knownChannel: number | undefined,
+	): number[] {
+		if (
+			knownChannel === undefined
+			|| request.destinationNodeId === this.#normalized.ownNodeId
+			|| !this.#includedNodeIds.has(request.destinationNodeId)
+			|| (request.transmitOptions & TRANSMIT_OPTION_ACK) === 0
+			|| (this.#dataRateRecoveryAfter.get(request.destinationNodeId) ?? 0)
+				> Date.now()
+			|| request.command.length === 0
+			|| [
+				CommandClasses["Z-Wave Protocol"],
+				CommandClasses.Security,
+				CommandClasses["Security 2"],
+				CommandClasses["Transport Service"],
+			].includes(request.command[0])
+		)
+			return [];
+		const protocolInfo = this.#nodeProtocolInfo.get(
+			request.destinationNodeId,
+		);
+		if (!protocolInfo) return [];
+		const peer = parseNodeProtocolInfo(protocolInfo, 0);
+		if (!peer.isListening) return [];
+		return getHigherDataRateChannels(
+			this.#regionConfig!.channels,
+			peer.supportedDataRates,
+			knownChannel,
+		);
 	}
 
 	#outboundRouteCandidates(
@@ -2957,6 +3082,7 @@ export class SoftwareController implements RawControllerTransport {
 				this.#includedNodeIds.delete(nodeId);
 				this.#quarantinedNodeIds.delete(nodeId);
 				this.#nodeChannels.delete(nodeId);
+				this.#dataRateRecoveryAfter.delete(nodeId);
 				this.#nodeProtocolInfo.delete(nodeId);
 				this.#flirsAwakeUntil.delete(nodeId);
 				this.#directNeighborNodeIds.delete(nodeId);
@@ -3088,7 +3214,8 @@ export class SoftwareController implements RawControllerTransport {
 				beamMode,
 				txPowerDeciDbm: this.#normalized.txPower,
 				cca: this.#normalized.cca,
-				maxAttempts: this.#normalized.maxAttempts,
+				maxAttempts:
+					radioOptions?.maxAttempts ?? this.#normalized.maxAttempts,
 			});
 		} catch (error) {
 			this.#handleRadioError(error);
@@ -3195,6 +3322,7 @@ export class SoftwareController implements RawControllerTransport {
 		request: ControllerTransmitRequest,
 		channelNumber: number,
 	): Promise<ControllerTransmitResult> {
+		const epoch = this.#networkStateEpoch;
 		const channel = this.#regionConfig!.channels.find(
 			(candidate) => candidate.channel === channelNumber,
 		);
@@ -3256,6 +3384,8 @@ export class SoftwareController implements RawControllerTransport {
 		} catch {
 			return { status: ControllerTransmitStatus.NoRoute };
 		}
+		if (!this.#canContinueSend(epoch))
+			return { status: ControllerTransmitStatus.Fail };
 		const route = [...searchResult.resultRepeaters];
 		if (
 			route.length > 4
@@ -3286,6 +3416,10 @@ export class SoftwareController implements RawControllerTransport {
 				this.#reportError(error),
 			);
 		}
+		void this.#rememberNodeChannel(
+			request.destinationNodeId,
+			channelNumber,
+		);
 		return {
 			status: ControllerTransmitStatus.OK,
 			txReport: {
@@ -3458,15 +3592,12 @@ export class SoftwareController implements RawControllerTransport {
 	readonly #handleMPDU = (mpdu: MPDU, info: MPDURxInfo): void => {
 		if (!this.#onFrame || this.#factoryDefaultOperation) return;
 		const belongsToNetwork = mpdu.homeId === this.#normalized.homeId;
-		const mayLearnChannel =
+		const mayObserveNetwork =
 			belongsToNetwork && this.#networkManagementSession === undefined;
-		if (mayLearnChannel && this.#includedNodeIds.has(mpdu.sourceNodeId)) {
+		if (mayObserveNetwork && this.#includedNodeIds.has(mpdu.sourceNodeId)) {
 			this.#markFlirsAwake(mpdu.sourceNodeId);
 		}
 		if (mpdu.headerType === MPDUHeaderType.Acknowledgement) {
-			if (mayLearnChannel) {
-				void this.#rememberNodeChannel(mpdu.sourceNodeId, info.channel);
-			}
 			if (this.#networkManagementSession) {
 				this.#diagnostic(
 					`MAC ACK observed from node ${mpdu.sourceNodeId} on channel ${info.channel}`,
@@ -3475,7 +3606,6 @@ export class SoftwareController implements RawControllerTransport {
 			return;
 		}
 		if (this.#resolveExplorerResult(mpdu)) {
-			void this.#rememberNodeChannel(mpdu.sourceNodeId, info.channel);
 			return;
 		}
 		if (mpdu.payload.length === 0) return;
@@ -3490,9 +3620,6 @@ export class SoftwareController implements RawControllerTransport {
 			)
 		)
 			return;
-		if (mayLearnChannel && destination === this.#normalized.ownNodeId) {
-			void this.#rememberNodeChannel(mpdu.sourceNodeId, info.channel);
-		}
 		const session = this.#networkManagementSession;
 		const isNodeInformationFrame = isNodeInformationFrameForController(
 			mpdu.payload,

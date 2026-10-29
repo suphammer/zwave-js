@@ -88,6 +88,42 @@ applied to broadcast, routed, or configuration-3 frames. This changes neither
 the selected PHY, payload, retry policy nor receive-window ownership. Correct
 flag encoding alone does not prove receipt of an application response.
 
+## Direct data-rate recovery
+
+A previously confirmed lower transmit rate is a working fallback, rather than
+a permanent speed limit. Before an ordinary ACK-requested public send, the
+controller may probe strictly faster Classic profiles advertised in an included
+peer's retained NIF. This requires an always-listening, non-FLiRS destination,
+a stored transmit channel, and a direct path. Protocol CC, Security, Security 2,
+Transport Service, broadcast, unknown peers, and internal node-information
+requests do not initiate these probes.
+
+The probes run under the caller's existing transmit fence, in descending data
+rate order. Each uses a direct ACK-requested NOP with one radio-local attempt.
+Distinct physical profiles remain separate even when their rates match; the
+finite declared region table and backend transaction deadlines bound the work.
+The current EU table has at most two faster profiles. A per-node 60-second
+cooldown starts before the first probe, with no background recovery timer, and
+is cleared when membership is removed, the controller is reset, or it stops.
+
+Only a missing ACK permits another candidate. If every higher probe misses,
+the original command is sent once at its existing rate. A successful NOP
+confirms and persists the faster transmit preference; an original caller NOP
+can reuse that result, while a real application command is sent once at the
+confirmed rate with its normal retry and receive-window policy. Other probe
+failures, radio faults, shutdown, and network reset abort the original send.
+Application DATA is never repeated on another rate by this policy.
+The existing missing-ACK fallback for a caller NOP also checks cancellation
+before continuing onto another route or PHY.
+
+Passive ACK, NIF, and application reception do not change the preferred transmit
+channel. A received packet alone does not prove that a proposed transmit PHY
+was acknowledged. Explorer discovery commits its actual transmit channel only
+after terminal transmit success and a valid correlated Search Result; an early
+result cannot publish preference while the local transmit is still unresolved.
+These software guarantees require corresponding RF tests before claiming
+device-specific rate recovery or application reliability.
+
 ## End-node inclusion verification
 
 After Assign IDs, an end node's new identity is verified with an acknowledged,

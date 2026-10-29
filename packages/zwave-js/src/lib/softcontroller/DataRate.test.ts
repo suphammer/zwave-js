@@ -8,6 +8,7 @@ import { Bytes } from "@zwave-js/shared";
 import { expect, test } from "vitest";
 
 import {
+	getHigherDataRateChannels,
 	getInclusionVerificationChannels,
 	shouldSetSpeedModified,
 } from "./DataRate.js";
@@ -24,6 +25,36 @@ const euChannels = [
 	{ channel: 1, dataRate: ProtocolDataRate.ZWave_40k },
 	{ channel: 2, dataRate: ProtocolDataRate.ZWave_9k6 },
 ];
+
+test("recovery orders only strictly faster advertised shared Classic rates", () => {
+	expect(getHigherDataRateChannels(euChannels, [40_000, 100_000], 2)).toEqual(
+		[0, 1],
+	);
+	expect(getHigherDataRateChannels(euChannels, [40_000, 100_000], 1)).toEqual(
+		[0],
+	);
+	expect(getHigherDataRateChannels(euChannels, [40_000, 100_000], 0)).toEqual(
+		[],
+	);
+	expect(getHigherDataRateChannels(euChannels, [40_000], 2)).toEqual([1]);
+	expect(getHigherDataRateChannels(euChannels, [], 2)).toEqual([]);
+	expect(getHigherDataRateChannels(euChannels, [100_000], 255)).toEqual([]);
+});
+
+test("recovery preserves distinct faster physical profiles without probing Long Range", () => {
+	const channels = [
+		{ channel: 7, dataRate: ProtocolDataRate.ZWave_9k6 },
+		{ channel: 10, dataRate: ProtocolDataRate.LongRange_100k },
+		{ channel: 9, dataRate: ProtocolDataRate.ZWave_40k },
+		{ channel: 8, dataRate: ProtocolDataRate.ZWave_40k },
+		{ channel: 2, dataRate: ProtocolDataRate.ZWave_100k },
+		{ channel: 3, dataRate: ProtocolDataRate.ZWave_100k },
+	];
+	expect(getHigherDataRateChannels(channels, [40_000, 100_000], 7)).toEqual([
+		2, 3, 9, 8,
+	]);
+	expect(getHigherDataRateChannels(channels, [100_000], 10)).toEqual([]);
+});
 
 test("Qubino's captured d39c01 NIF retains the observed 9.6 kbit/s PHY before trying advertised 40 kbit/s", () => {
 	const nif = parseOverAirNodeInformationFrame(

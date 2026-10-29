@@ -11,6 +11,37 @@ const classicBitRates = new Map<ProtocolDataRate, number>([
 	[ProtocolDataRate.ZWave_100k, 100_000],
 ]);
 
+/** Recovery probes require a strictly faster, advertised shared Classic rate. */
+export function getHigherDataRateChannels(
+	channels: readonly { channel: number; dataRate: ProtocolDataRate }[],
+	peerBitRates: readonly number[],
+	currentChannel: number,
+): number[] {
+	const current = channels.find(({ channel }) => channel === currentChannel);
+	const currentBitRate = current && classicBitRates.get(current.dataRate);
+	if (currentBitRate === undefined) return [];
+	const seenChannels = new Set<number>();
+	return channels
+		.toSorted(
+			(left, right) =>
+				(classicBitRates.get(right.dataRate) ?? 0)
+				- (classicBitRates.get(left.dataRate) ?? 0),
+		)
+		.filter(({ channel, dataRate }) => {
+			const bitRate = classicBitRates.get(dataRate);
+			if (
+				bitRate === undefined
+				|| bitRate <= currentBitRate
+				|| !peerBitRates.includes(bitRate)
+				|| seenChannels.has(channel)
+			)
+				return false;
+			seenChannels.add(channel);
+			return true;
+		})
+		.map(({ channel }) => channel);
+}
+
 /** NOP verification may safely try another shared PHY after a missing ACK. */
 export function getInclusionVerificationChannels(
 	channels: readonly { channel: number; dataRate: ProtocolDataRate }[],
