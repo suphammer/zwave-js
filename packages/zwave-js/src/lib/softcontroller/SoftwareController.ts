@@ -42,6 +42,7 @@ import {
 	type RawControllerTransport,
 } from "./ControllerBackend.js";
 import { generateRandomHomeId } from "./ControllerState.js";
+import { getExclusionTarget } from "./Exclusion.js";
 import {
 	isNodeInformationFrameForController,
 	parseOverAirNodeInformationFrame,
@@ -201,6 +202,7 @@ interface ExclusionManagementSession {
 	onEvent: (event: ControllerExclusionEvent) => void;
 	ready: Promise<void>;
 	operation?: Promise<void>;
+	presentationTimer?: ReturnType<typeof setTimeout>;
 	failed: boolean;
 	stopping: boolean;
 }
@@ -696,8 +698,8 @@ export class SoftwareController implements RawControllerTransport {
 		if (!session) return;
 
 		session.stopping = true;
+		this.#stopTransferPresentation(session);
 		if (session.kind === "inclusion") {
-			this.#stopTransferPresentation(session);
 			this.#rejectInclusionWaiter(
 				session,
 				new Error(
@@ -1542,6 +1544,7 @@ export class SoftwareController implements RawControllerTransport {
 		holdRx = false,
 		alternateRx = false,
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
+		routeOverride?: readonly number[] | null,
 	): Promise<ControllerTransmitResult> {
 		if (this.#sendInFlight || this.#factoryDefaultOperation) {
 			return { status: ControllerTransmitStatus.NotIdle };
@@ -1553,7 +1556,7 @@ export class SoftwareController implements RawControllerTransport {
 			homeId,
 			holdRx,
 			alternateRx,
-			undefined,
+			routeOverride,
 			destinationBeamModeOverride,
 		);
 		this.#activeSend = operation;
@@ -1689,10 +1692,11 @@ export class SoftwareController implements RawControllerTransport {
 		// accept the random/foreign Home ID used by an unassigned node's NIF.
 		session.ready = (async () => {
 			await this.#configure(radio, "inclusion");
+			if (session.stopping) return;
 			// A primary controller announces the controller-replication service on
 			// the inclusion channel. End nodes may ignore this Protocol CC frame;
 			// joining controllers use it to identify an inclusion transfer.
-			await this.#sendTransferPresentation();
+			await this.#sendTransferPresentation(session.kind);
 		})();
 		try {
 			await session.ready;
@@ -1705,11 +1709,7 @@ export class SoftwareController implements RawControllerTransport {
 				`Inclusion receiver ready (Home ID filter disabled, fixed inclusion channel ${inclusionChannel}, ${protocolDataRateToString(channelInfo.dataRate)}, region ${this.#normalized.region})`,
 			);
 		} catch (error) {
-			this.#stopTransferPresentation(session);
-			if (this.#networkManagementSession === session) {
-				this.#networkManagementSession = undefined;
-			}
-			throw error;
+			await this.#failNetworkManagementStartup(session, error);
 		}
 	}
 
@@ -1766,21 +1766,51 @@ export class SoftwareController implements RawControllerTransport {
 			stopping: false,
 		};
 		this.#networkManagementSession = session;
-		session.ready = this.#configure(radio, "inclusion");
+		session.ready = (async () => {
+			await this.#configure(radio, "inclusion");
+			if (session.stopping) return;
+			await this.#sendTransferPresentation(session.kind);
+		})();
 		try {
 			await session.ready;
+			this.#scheduleTransferPresentation(session);
+			this.#diagnostic(
+				`Exclusion receiver ready (Home ID filter disabled, fixed channel ${this.#getInclusionChannel()})`,
+			);
 		} catch (error) {
+			await this.#failNetworkManagementStartup(session, error);
+		}
+	}
+
+	async #failNetworkManagementStartup(
+		session: NetworkManagementSession,
+		error: unknown,
+	): Promise<never> {
+		this.#stopTransferPresentation(session);
+		let failure = error;
+		let cleanupFailure: { error: unknown } | undefined;
+		try {
+			await this.#restoreNormalFiltering();
+		} catch (cleanupError) {
+			cleanupFailure = { error: cleanupError };
+			failure = new AggregateError(
+				[...new Set([error, cleanupError])],
+				`${session.kind} startup and receiver cleanup failed`,
+			);
+		} finally {
 			if (this.#networkManagementSession === session) {
 				this.#networkManagementSession = undefined;
 			}
-			throw error;
 		}
+		if (cleanupFailure) this.#handleRadioError(cleanupFailure.error);
+		throw failure;
 	}
 
 	async #stopExclusion(): Promise<void> {
 		const session = this.#networkManagementSession;
 		if (!session || session.kind !== "exclusion") return;
 		session.stopping = true;
+		this.#stopTransferPresentation(session);
 		await session.ready.catch(() => undefined);
 		await session.operation?.catch(() => undefined);
 		await this.#restoreNormalFiltering();
@@ -1798,8 +1828,30 @@ export class SoftwareController implements RawControllerTransport {
 	}
 
 	async #restoreNormalFiltering(): Promise<void> {
-		if (!this.#started || this.#faulted) return;
-		await this.#configure(this.#radio, "network");
+		if (!this.#started) return;
+		const mode =
+			this.#faulted || this.#factoryDefaultOperation
+				? "disabled"
+				: "network";
+		try {
+			await this.#configure(this.#radio, mode);
+		} catch (error) {
+			this.#faulted = true;
+			if (this.#networkManagementSession) {
+				this.#stopTransferPresentation(this.#networkManagementSession);
+			}
+			if (mode === "network") {
+				try {
+					await this.#configure(this.#radio, "disabled");
+				} catch (disableError) {
+					throw new AggregateError(
+						[...new Set([error, disableError])],
+						"Receiver restoration and MAC disable failed",
+					);
+				}
+			}
+			throw error;
+		}
 	}
 
 	#nextNodeId(): number | undefined {
@@ -1843,7 +1895,9 @@ export class SoftwareController implements RawControllerTransport {
 		);
 	}
 
-	async #sendTransferPresentation(): Promise<void> {
+	async #sendTransferPresentation(
+		kind: NetworkManagementSession["kind"],
+	): Promise<void> {
 		// Keep the receiver on the selected channel between presentations instead of
 		// returning to the 30 ms three-channel hopping loop, which can miss an
 		// entire long 9.6 kbit/s NIF when it tunes in after sync.
@@ -1851,7 +1905,11 @@ export class SoftwareController implements RawControllerTransport {
 		const presentation = await this.#runSend(
 			{
 				destinationNodeId: NODE_ID_BROADCAST,
-				command: Bytes.from([PROTOCOL_CC, 0x08, 0x05]),
+				command: Bytes.from([
+					PROTOCOL_CC,
+					0x08,
+					kind === "inclusion" ? 0x05 : 0x03,
+				]),
 				transmitOptions: 0,
 			},
 			inclusionChannel,
@@ -1860,17 +1918,27 @@ export class SoftwareController implements RawControllerTransport {
 		);
 		if (presentation.status !== ControllerTransmitStatus.OK) {
 			throw new Error(
-				"Controller transfer presentation could not be transmitted",
+				`Controller ${kind} transfer presentation could not be transmitted`,
 			);
 		}
 	}
 
-	#scheduleTransferPresentation(session: InclusionManagementSession): void {
+	#scheduleTransferPresentation(session: NetworkManagementSession): void {
 		if (session.presentationTimer) clearTimeout(session.presentationTimer);
+		if (
+			this.#networkManagementSession !== session
+			|| this.#faulted
+			|| session.stopping
+			|| session.failed
+			|| session.operation
+		) {
+			return;
+		}
 		session.presentationTimer = setTimeout(() => {
 			delete session.presentationTimer;
 			if (
 				this.#networkManagementSession !== session
+				|| this.#faulted
 				|| session.stopping
 				|| session.failed
 				|| session.operation
@@ -1880,10 +1948,13 @@ export class SoftwareController implements RawControllerTransport {
 				this.#scheduleTransferPresentation(session);
 				return;
 			}
-			void this.#sendTransferPresentation().then(
+			void this.#sendTransferPresentation(session.kind).then(
 				() => this.#scheduleTransferPresentation(session),
-				(error) => {
+				async (error) => {
 					session.failed = true;
+					await this.#restoreNormalFiltering().catch((cleanupError) =>
+						this.#handleRadioError(cleanupError),
+					);
 					session.onEvent({ type: "failed", error });
 					this.#reportError(error);
 				},
@@ -1892,7 +1963,7 @@ export class SoftwareController implements RawControllerTransport {
 		session.presentationTimer.unref();
 	}
 
-	#stopTransferPresentation(session: InclusionManagementSession): void {
+	#stopTransferPresentation(session: NetworkManagementSession): void {
 		if (!session.presentationTimer) return;
 		clearTimeout(session.presentationTimer);
 		delete session.presentationTimer;
@@ -2659,35 +2730,23 @@ export class SoftwareController implements RawControllerTransport {
 		info: MPDURxInfo,
 	): void {
 		if (session.stopping || session.failed || session.operation) return;
-		if (
-			mpdu.homeId !== this.#normalized.homeId
-			|| mpdu.sourceNodeId === this.#normalized.ownNodeId
-			|| (!this.#includedNodeIds.has(mpdu.sourceNodeId)
-				&& !this.#quarantinedNodeIds.has(mpdu.sourceNodeId))
-		)
-			return;
-
-		let nodeInformation: NodeInformationFrame;
-		try {
-			nodeInformation = parseOverAirNodeInformationFrame(
-				mpdu.payload.subarray(2),
-			);
-		} catch {
-			return;
-		}
+		const target = getExclusionTarget(mpdu, this.#normalized);
+		if (!target) return;
 		if (
 			!this.#matchesRequestedNodeType(
 				session.request,
-				nodeInformation.nodeType,
+				target.nodeInformation.nodeType,
 			)
 		) {
 			return;
 		}
 
+		this.#stopTransferPresentation(session);
 		const operation = this.#completeExclusion(
 			session,
-			mpdu.sourceNodeId,
-			nodeInformation.nodeType,
+			target.nodeId,
+			target.callbackNodeId,
+			target.nodeInformation.nodeType,
 			info.channel,
 		);
 		const trackedOperation = operation.finally(() => {
@@ -2700,14 +2759,19 @@ export class SoftwareController implements RawControllerTransport {
 	async #completeExclusion(
 		session: ExclusionManagementSession,
 		nodeId: number,
+		callbackNodeId: number,
 		nodeType: NodeType,
 		receiveChannel: number,
 	): Promise<void> {
 		try {
 			await session.ready;
-			if (session.stopping) return;
+			await this.#activeSend;
+			if (session.stopping || session.failed) return;
 			session.onEvent({ type: "node-found" });
 			if (session.stopping) return;
+			// A learning foreign node accepts Assign IDs on the excluding
+			// controller's Home ID (Network Specification NWK:01C8.1). Numeric
+			// node-ID collisions must not borrow our routes or FLiRS metadata.
 			const result = await this.#runSend(
 				{
 					destinationNodeId: nodeId,
@@ -2718,6 +2782,7 @@ export class SoftwareController implements RawControllerTransport {
 				this.#normalized.homeId,
 				false,
 				false,
+				null,
 				null,
 			);
 			if (result.status !== ControllerTransmitStatus.OK) {
@@ -2732,39 +2797,43 @@ export class SoftwareController implements RawControllerTransport {
 					nodeType === NodeType.Controller
 						? "controller"
 						: "end-node",
-				nodeId,
+				nodeId: callbackNodeId,
 			});
-			this.#includedNodeIds.delete(nodeId);
-			this.#quarantinedNodeIds.delete(nodeId);
-			this.#nodeChannels.delete(nodeId);
-			this.#nodeProtocolInfo.delete(nodeId);
-			this.#flirsAwakeUntil.delete(nodeId);
-			this.#directNeighborNodeIds.delete(nodeId);
-			this.#nodeNeighbors.delete(nodeId);
-			this.#repeaterNodeIds.delete(nodeId);
-			this.#routes.delete(nodeId);
-			for (const [sourceNodeId, neighbors] of this.#nodeNeighbors) {
-				if (!neighbors.includes(nodeId)) continue;
-				this.#nodeNeighbors.set(
-					sourceNodeId,
-					Object.freeze(
-						neighbors.filter((neighborId) => neighborId !== nodeId),
-					),
-				);
-			}
-			for (const [destinationNodeId, route] of this.#routes) {
-				if (route.includes(nodeId))
-					this.#routes.delete(destinationNodeId);
-			}
-			try {
-				await this.#persistControllerState();
-			} catch (error) {
-				// Assign IDs(0, 0) was ACKed and cannot be rolled back. Keep the
-				// in-memory removal and complete honestly instead of resurrecting the
-				// node ID in this session or reporting an RF failure.
-				this.#diagnostic(
-					`Node ${nodeId} was excluded, but persistent state failed: ${this.#errorMessage(error)}`,
-				);
+			if (callbackNodeId !== 0) {
+				this.#includedNodeIds.delete(nodeId);
+				this.#quarantinedNodeIds.delete(nodeId);
+				this.#nodeChannels.delete(nodeId);
+				this.#nodeProtocolInfo.delete(nodeId);
+				this.#flirsAwakeUntil.delete(nodeId);
+				this.#directNeighborNodeIds.delete(nodeId);
+				this.#nodeNeighbors.delete(nodeId);
+				this.#repeaterNodeIds.delete(nodeId);
+				this.#routes.delete(nodeId);
+				for (const [sourceNodeId, neighbors] of this.#nodeNeighbors) {
+					if (!neighbors.includes(nodeId)) continue;
+					this.#nodeNeighbors.set(
+						sourceNodeId,
+						Object.freeze(
+							neighbors.filter(
+								(neighborId) => neighborId !== nodeId,
+							),
+						),
+					);
+				}
+				for (const [destinationNodeId, route] of this.#routes) {
+					if (route.includes(nodeId))
+						this.#routes.delete(destinationNodeId);
+				}
+				try {
+					await this.#persistControllerState();
+				} catch (error) {
+					// Assign IDs(0, 0) was ACKed and cannot be rolled back. Keep the
+					// in-memory removal and complete honestly instead of resurrecting the
+					// node ID in this session or reporting an RF failure.
+					this.#diagnostic(
+						`Node ${nodeId} was excluded, but persistent state failed: ${this.#errorMessage(error)}`,
+					);
+				}
 			}
 			await this.#restoreNormalFiltering().catch((error) => {
 				this.#reportError(error);
@@ -3176,11 +3245,11 @@ export class SoftwareController implements RawControllerTransport {
 	readonly #handleMPDU = (mpdu: MPDU, info: MPDURxInfo): void => {
 		if (!this.#onFrame || this.#factoryDefaultOperation) return;
 		const belongsToNetwork = mpdu.homeId === this.#normalized.homeId;
-		if (belongsToNetwork && this.#includedNodeIds.has(mpdu.sourceNodeId)) {
-			this.#markFlirsAwake(mpdu.sourceNodeId);
-		}
 		const mayLearnChannel =
 			belongsToNetwork && this.#networkManagementSession === undefined;
+		if (mayLearnChannel && this.#includedNodeIds.has(mpdu.sourceNodeId)) {
+			this.#markFlirsAwake(mpdu.sourceNodeId);
+		}
 		if (mpdu.headerType === MPDUHeaderType.Acknowledgement) {
 			if (mayLearnChannel) {
 				void this.#rememberNodeChannel(mpdu.sourceNodeId, info.channel);
@@ -3326,6 +3395,9 @@ export class SoftwareController implements RawControllerTransport {
 
 	readonly #handleRadioError = (error: unknown): void => {
 		this.#nodeInformationRequest?.cancel();
+		if (this.#networkManagementSession) {
+			this.#stopTransferPresentation(this.#networkManagementSession);
+		}
 		this.#faulted = true;
 		this.#reportError(error);
 	};

@@ -112,6 +112,7 @@ export type ControllerExclusionEvent =
 	| {
 			type: "removing-node";
 			nodeType: Exclude<ControllerNetworkManagementNodeType, "any">;
+			/** Zero when the excluded device belongs to another network. */
 			nodeId: number;
 	  }
 	| { type: "done" }
@@ -230,6 +231,19 @@ export function encodeControllerNodeProtocolInfo(
 		);
 	}
 	return Uint8Array.from(observed);
+}
+
+/** A foreign-network device has no node ID in the controller's own node map. */
+export function encodeExclusionNodeId(
+	nodeId: number,
+	ownNodeId: number,
+): number {
+	if (nodeId === 0) return 0;
+	assertClassicNodeId(nodeId, "excluded node ID");
+	if (nodeId === ownNodeId) {
+		throw new Error("The controller cannot exclude its own node ID");
+	}
+	return nodeId;
 }
 
 const ADD_NODE_TYPE_ANY = 0x01;
@@ -1689,13 +1703,10 @@ class ControllerBindingRuntime {
 							`Unexpected exclusion removing-node event in ${session.phase} phase`,
 						);
 					}
-					assertClassicNodeId(event.nodeId, "excluded node ID");
-					if (event.nodeId === this.#ownNodeId) {
-						throw new Error(
-							"The controller cannot exclude its own node ID",
-						);
-					}
-					session.pendingNodeId = event.nodeId;
+					session.pendingNodeId = encodeExclusionNodeId(
+						event.nodeId,
+						this.#ownNodeId,
+					);
 					session.phase = "removing";
 					this.#emitNetworkManagementStatus(
 						SerialApiFunction.RemoveNodeFromNetwork,
@@ -1716,8 +1727,10 @@ class ControllerBindingRuntime {
 							`Unexpected exclusion done event in ${session.phase} phase`,
 						);
 					}
-					this.#includedNodeIds.delete(session.pendingNodeId);
-					this.#publishControllerState();
+					if (session.pendingNodeId !== 0) {
+						this.#includedNodeIds.delete(session.pendingNodeId);
+						this.#publishControllerState();
+					}
 					session.phase = "done";
 					this.#emitNetworkManagementStatus(
 						SerialApiFunction.RemoveNodeFromNetwork,

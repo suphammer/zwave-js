@@ -40,6 +40,36 @@ transmit cancellation remain disabled for the initial software controller.
 Missing node protocol information and unobserved links must not become
 invented device capabilities or routes.
 
+## Classic exclusion
+
+Direct exclusion accepts a learning NIF from a device in another network.
+The NIF must be direct, contain a valid assigned Classic node ID, and not
+request an ACK. The controller sends Assign IDs with zero Node ID and Home ID
+on its own Home ID, as required by Network Specification NWK:01C8.1. The
+transaction uses the received channel without borrowing an existing route or
+wake-up configuration from a numerically matching local node.
+
+Inclusion and exclusion send their corresponding Transfer Presentation
+commands on the configured inclusion channel and hold reception there between
+presentations. On Suphacap, local MAC `HOLD_RX` keeps a complete 9.6 kbit/s NIF
+from being missed while hopping. Accepting a NIF cancels further presentations;
+stop, reset, shutdown, and radio faults also cancel the presentation timer.
+Startup and presentation failures restore normal reception, or disable MAC
+when the radio is faulted or a controller reset is pending.
+
+A successful exclusion from another network reports the Serial API's unknown
+node ID zero. It does not remove a node from this controller's cache, change
+its Home ID, or write its stored membership, routes, or channel information.
+Own-network exclusions retain the actual node ID and persist the removal.
+Completion requires the radio's acknowledged Assign IDs result; queuing a
+transmission or observing an unrelated NIF is not exclusion evidence.
+
+Foreign exclusion does not use ordinary NOP verification on the controller's
+network; see the [Silicon Labs protocol change notes](https://docs.silabs.com/z-wave/7.24.0/zwave-api/).
+This direct path does not implement Network Wide Exclusion or high-power
+overrides. Physical compatibility still requires validation with the device
+and radio backend being used.
+
 ## Adding another radio
 
 A radio implementation supplies the `SoftwareControllerRadio` contract and
