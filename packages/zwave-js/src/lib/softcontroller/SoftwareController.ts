@@ -49,7 +49,10 @@ import {
 	type RawControllerTransport,
 } from "./ControllerBackend.js";
 import { generateRandomHomeId } from "./ControllerState.js";
-import { shouldSetSpeedModified } from "./DataRate.js";
+import {
+	getInclusionVerificationChannels,
+	shouldSetSpeedModified,
+} from "./DataRate.js";
 import { getExclusionTarget } from "./Exclusion.js";
 import {
 	isNodeInformationFrameForController,
@@ -2589,7 +2592,6 @@ export class SoftwareController implements RawControllerTransport {
 		const joiningController =
 			nodeInformation.nodeType === NodeType.Controller;
 		let assignmentMayHaveSucceeded = false;
-		let endNodeProtocolInfoStaged = false;
 		const joiningBeamMode = joiningController
 			? undefined
 			: beamModeFromProtocolInfo(joiningProtocolInfo);
@@ -2601,9 +2603,18 @@ export class SoftwareController implements RawControllerTransport {
 							candidate.dataRate === ProtocolDataRate.ZWave_40k,
 					)?.channel
 				: undefined;
-		const nodeChannel = joiningBeamMode
+		let nodeChannel = joiningBeamMode
 			? flirsChannel
 			: this.#preferredNodeChannel(nodeInformation.supportedDataRates);
+		const verificationChannels = joiningController
+			? []
+			: getInclusionVerificationChannels(
+					this.#regionConfig!.channels,
+					nodeInformation.supportedDataRates,
+					nodeChannel ?? this.#normalized.channel,
+					receiveChannel,
+					joiningBeamMode !== undefined,
+				);
 		try {
 			await session.ready;
 			if (session.stopping) return;
@@ -2626,6 +2637,11 @@ export class SoftwareController implements RawControllerTransport {
 			if (joiningBeamMode && !this.#radio.capabilities.beamTx) {
 				throw new Error(
 					"The radio cannot provide the beam required by the joining FLiRS node",
+				);
+			}
+			if (!joiningController && verificationChannels.length === 0) {
+				throw new Error(
+					"The joining node has no observed or advertised Classic verification channel",
 				);
 			}
 			session.onEvent({ type: "node-found" });
@@ -2714,34 +2730,45 @@ export class SoftwareController implements RawControllerTransport {
 					joiningProtocolInfo,
 				);
 			} else {
-				// Inclusion already gave us the exact NIF. Stage it before the
-				// post-Assign-IDs verification so a FLiRS end node is verified with
-				// the same atomic beam path it will require after commissioning.
-				// This is not persistent state until the verification succeeds.
-				this.#nodeProtocolInfo.set(
-					nodeId,
-					Bytes.from(joiningProtocolInfo),
-				);
-				endNodeProtocolInfoStaged = true;
-				const verifyResult = await this.#runSend(
-					{
-						destinationNodeId: nodeId,
-						command: Uint8Array.of(0x00),
-						transmitOptions: TRANSMIT_OPTION_ACK,
-					},
-					nodeChannel!,
-					this.#normalized.homeId,
-					false,
-					false,
-					joiningBeamMode ?? null,
-				);
-				if (verifyResult.status !== ControllerTransmitStatus.OK) {
+				let verifiedChannel: number | undefined;
+				for (const channel of verificationChannels) {
+					if (session.stopping)
+						throw new Error("Inclusion was stopped");
+					// NOP is idempotent. Keep all new-node data local until an ACK
+					// verifies its identity, without borrowing routes from another ID.
+					const verifyResult = await this.#runSend(
+						{
+							destinationNodeId: nodeId,
+							command: Uint8Array.of(0x00),
+							transmitOptions: TRANSMIT_OPTION_ACK,
+						},
+						channel,
+						this.#normalized.homeId,
+						false,
+						false,
+						joiningBeamMode ?? null,
+						null,
+						this.#assignmentSpeedModified(
+							channel,
+							nodeInformation.supportedDataRates,
+						),
+					);
+					this.#diagnostic(
+						`Assigned node ${nodeId} verification status ${verifyResult.status} on channel ${channel}`,
+					);
+					if (verifyResult.status === ControllerTransmitStatus.OK) {
+						verifiedChannel = channel;
+						break;
+					}
+					if (verifyResult.status !== ControllerTransmitStatus.NoAck)
+						break;
+				}
+				if (verifiedChannel === undefined) {
 					throw new Error(
-						assignResult.status === ControllerTransmitStatus.OK
-							? "The joining node acknowledged Assign IDs but not the assigned node ID"
-							: "The joining node did not accept Assign IDs",
+						"The assigned node ID could not be verified on an observed or advertised Classic channel",
 					);
 				}
+				nodeChannel = verifiedChannel;
 			}
 
 			this.#includedNodeIds.add(nodeId);
@@ -2766,13 +2793,6 @@ export class SoftwareController implements RawControllerTransport {
 			session.onEvent({ type: "protocol-done" });
 			this.#diagnostic(`Inclusion committed as node ${nodeId}`);
 		} catch (error) {
-			if (
-				endNodeProtocolInfoStaged
-				&& !this.#includedNodeIds.has(nodeId)
-			) {
-				this.#nodeProtocolInfo.delete(nodeId);
-				this.#flirsAwakeUntil.delete(nodeId);
-			}
 			this.#rejectInclusionWaiter(
 				session,
 				error instanceof Error ? error : new Error(String(error)),

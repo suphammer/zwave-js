@@ -59,6 +59,33 @@ The separate atomic wake-up-beam contract does not support a held response
 window, so a transmit requiring a beam is excluded. These software boundaries
 do not qualify routed or FLiRS response timing in hardware.
 
+## End-node inclusion verification
+
+After Assign IDs, an end node's new identity is verified with an acknowledged,
+direct NOP. Verification first uses the preferred advertised Classic channel,
+then the channel on which its learning NIF was actually received, followed by
+remaining advertised Classic profiles available on the radio. A received NIF
+is positive PHY evidence even when a legacy node omits that rate bit. Distinct
+same-rate channels remain distinct; logical channel numbers do not imply a
+frequency, data rate, or physical slot. Reduced verification rates set Speed
+Modified from the received peer capabilities and the radio's shared maximum.
+
+Only an idempotent NOP receives this fallback. Missing ACKs permit another
+candidate; other transmit failures or cancellation stop verification. No
+existing routes or numeric-node-ID metadata are borrowed. FLiRS verification
+keeps its explicit atomic beam and uses only 40 kbit/s; controller replication
+retains its separate transfer sequence. These policies do not qualify a new
+device or PHY without corresponding RF evidence.
+
+The first acknowledged candidate determines the persisted channel. Membership,
+protocol information, and topology for the new node become visible to durable
+snapshots together, after verification. Concurrent traffic from existing nodes
+cannot persist an uncommitted node's NIF. If assignment may have succeeded but
+verification fails, its ID remains quarantined and cannot be reused. Incoming
+traffic alone does not promote a quarantined node. Recover a partly joined
+device through ordinary exclusion and a new inclusion, rather than editing the
+node mask or adding it synthetically.
+
 ## Classic exclusion
 
 Direct exclusion accepts a learning NIF from a device in another network.
