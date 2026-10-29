@@ -140,6 +140,21 @@ Driver. The operation sends at most two requests, adds no NOP or higher-rate TX
 probe, and does not change the ACK-confirmed preferred transmit channel from
 passive NIF reception or unacknowledged local transmit completion.
 
+Valid unsolicited NIFs from included, assigned Classic nodes also become the
+standard `ApplicationUpdate(NodeInfoReceived)` event. The upstream Driver then
+updates the node's Command Classes, marks an awake battery node accordingly,
+and resumes its queued interview. Only singlecast or broadcast NIFs are accepted;
+foreign-Home, Explorer, multicast, routed-busy, own-node, and nonmember NIF
+candidates are consumed without application callbacks. Truncated or otherwise
+malformed NIFs are consumed too. No new device-class registry whitelist is used.
+
+A NIF completes an outstanding node-information request only when its source
+matches that request. Another included node's unsolicited update leaves the
+pending request intact. Parsing and Serial API encoding finish before matching
+request ownership is released, and an invalid bounded transport result cannot
+leave a completed transport operation registered as pending. None of these
+updates promotes the ACK-confirmed preferred transmit PHY from passive RX.
+
 ## End-node inclusion verification
 
 After Assign IDs, an end node's new identity is verified with an acknowledged,

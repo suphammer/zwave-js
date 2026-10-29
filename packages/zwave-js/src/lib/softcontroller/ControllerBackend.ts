@@ -581,7 +581,11 @@ class ControllerBindingRuntime {
 	}
 
 	#queueFrame(frame: SerialApiFrame): void {
-		this.#outboundFrames.push(encodeSerialApiFrame(frame));
+		this.#queueEncodedFrame(encodeSerialApiFrame(frame));
+	}
+
+	#queueEncodedFrame(frame: BytesView): void {
+		this.#outboundFrames.push(frame);
 		this.#flushOutbound();
 	}
 
@@ -1191,7 +1195,11 @@ class ControllerBindingRuntime {
 							|| this.#pendingNodeInfoRequest !== pending
 						)
 							return;
-						if (!frame || !this.#handleNodeInfoFrame(frame))
+						if (
+							!frame
+							|| !this.#handleNodeInfoFrame(frame)
+							|| this.#pendingNodeInfoRequest === pending
+						)
 							this.#failNodeInfoRequest(pending);
 					},
 					(error) => {
@@ -1224,22 +1232,39 @@ class ControllerBindingRuntime {
 	}
 
 	#handleNodeInfoFrame(frame: ControllerApplicationFrame): boolean {
-		const pending = this.#pendingNodeInfoRequest;
 		if (
-			!pending
-			|| frame.sourceNodeId !== pending.nodeId
-			|| frame.command.length < 2
-			|| frame.command[0] !== 0x01
-			|| frame.command[1] !== 0x01
+			frame.command[0] !== 0x01
+			|| (frame.command.length > 1 && frame.command[1] !== 0x01)
 		)
 			return false;
+		// NIFs are network updates, including malformed or ineligible candidates;
+		// they must never reach the Driver as application Command Classes.
+		if (
+			this.#closed
+			|| this.#factoryDefaultInFlight
+			|| !Number.isInteger(frame.sourceNodeId)
+			|| frame.sourceNodeId < 1
+			|| frame.sourceNodeId > CLASSIC_NODE_ID_MAX
+			|| frame.sourceNodeId === this.#ownNodeId
+			|| !this.#includedNodeIds.has(frame.sourceNodeId)
+			|| frame.isForeignFrame
+			|| frame.fromForeignHomeId
+			|| frame.isExploreFrame
+			|| frame.routedBusy
+			|| (frame.frameType !== undefined
+				&& frame.frameType !== "singlecast"
+				&& frame.frameType !== "broadcast")
+		)
+			return true;
+		const pending = this.#pendingNodeInfoRequest;
+		const matchingPending =
+			pending?.nodeId === frame.sourceNodeId ? pending : undefined;
 
 		try {
 			const nodeInformation = parseOverAirNodeInformationFrame(
 				frame.command.subarray(2),
 			);
-			this.#completeNodeInfoRequest(pending);
-			this.#queueFrame({
+			const update = encodeSerialApiFrame({
 				type: SerialApiMessageType.Request,
 				functionType: SerialApiFunction.ApplicationUpdate,
 				payload: concat(
@@ -1257,8 +1282,10 @@ class ControllerBindingRuntime {
 					}),
 				),
 			});
+			if (matchingPending) this.#completeNodeInfoRequest(matchingPending);
+			this.#queueEncodedFrame(update);
 		} catch {
-			this.#failNodeInfoRequest(pending);
+			if (matchingPending) this.#failNodeInfoRequest(matchingPending);
 		}
 		return true;
 	}
