@@ -29,6 +29,7 @@ import { Bytes, type BytesView } from "@zwave-js/shared";
 
 import type { ControllerFirmwareInfo } from "../driver/ControllerFirmwareInfo.js";
 
+import { canMatchAcknowledgementHomeId } from "./AcknowledgementHomeId.js";
 import {
 	ApplicationResponseWindow,
 	shouldHoldApplicationResponse,
@@ -61,6 +62,7 @@ import type {
 	SoftwareControllerRegionConfig,
 	SoftwareControllerBeamMode,
 	SoftwareControllerMPDURxInfo,
+	SoftwareControllerRadioTransmitOptions,
 } from "./SoftwareControllerRadio.js";
 
 const BEAM_MODE_SHORT: SoftwareControllerBeamMode = "250ms";
@@ -1567,6 +1569,7 @@ export class SoftwareController implements RawControllerTransport {
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
 		routeOverride?: readonly number[] | null,
 		speedModified = false,
+		radioOptions?: SoftwareControllerRadioTransmitOptions,
 	): Promise<ControllerTransmitResult> {
 		if (this.#sendInFlight || this.#factoryDefaultOperation) {
 			return { status: ControllerTransmitStatus.NotIdle };
@@ -1581,6 +1584,8 @@ export class SoftwareController implements RawControllerTransport {
 			routeOverride,
 			destinationBeamModeOverride,
 			speedModified,
+			false,
+			radioOptions,
 		);
 		this.#activeSend = operation;
 		try {
@@ -1601,6 +1606,7 @@ export class SoftwareController implements RawControllerTransport {
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
 		speedModified = false,
 		applicationResponse = false,
+		radioOptions?: SoftwareControllerRadioTransmitOptions,
 	): Promise<ControllerTransmitResult> {
 		const destinationBeamMode =
 			destinationBeamModeOverride === undefined
@@ -1633,6 +1639,19 @@ export class SoftwareController implements RawControllerTransport {
 			&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0
 			&& routedRepeaters === undefined;
 		const beamMode = directRoute ? destinationBeamMode : undefined;
+		if (
+			!canMatchAcknowledgementHomeId(
+				radioOptions?.acknowledgementHomeId,
+				this.#radio.capabilities,
+				directRoute,
+				!!beamMode,
+			)
+		) {
+			this.#diagnostic(
+				"Radio cannot match the requested foreign-network ACK identity",
+			);
+			return { status: ControllerTransmitStatus.Fail };
+		}
 		const holdApplicationResponse =
 			applicationResponse
 			&& !holdRx
@@ -1662,6 +1681,7 @@ export class SoftwareController implements RawControllerTransport {
 			holdRx || holdApplicationResponse,
 			alternateRx,
 			beamMode,
+			radioOptions,
 		);
 		if (holdApplicationResponse) {
 			if (
@@ -2820,6 +2840,7 @@ export class SoftwareController implements RawControllerTransport {
 			target.nodeInformation.nodeType,
 			info.channel,
 			target.nodeInformation.supportedDataRates,
+			target.acknowledgementHomeId,
 		);
 		const trackedOperation = operation.finally(() => {
 			if (session.operation === trackedOperation)
@@ -2835,6 +2856,7 @@ export class SoftwareController implements RawControllerTransport {
 		nodeType: NodeType,
 		receiveChannel: number,
 		peerBitRates: readonly number[],
+		acknowledgementHomeId?: number,
 	): Promise<void> {
 		try {
 			await session.ready;
@@ -2858,6 +2880,9 @@ export class SoftwareController implements RawControllerTransport {
 				null,
 				null,
 				this.#assignmentSpeedModified(receiveChannel, peerBitRates),
+				acknowledgementHomeId === undefined
+					? undefined
+					: { acknowledgementHomeId },
 			);
 			if (result.status !== ControllerTransmitStatus.OK) {
 				throw new Error(
@@ -2977,10 +3002,12 @@ export class SoftwareController implements RawControllerTransport {
 		holdRx = false,
 		alternateRx = false,
 		beamMode?: SoftwareControllerBeamMode,
+		radioOptions?: SoftwareControllerRadioTransmitOptions,
 	) {
 		this.#applicationResponseWindow.cancel();
 		try {
 			return await this.#radio.transmit({
+				...radioOptions,
 				mpdu,
 				channel,
 				holdRx,

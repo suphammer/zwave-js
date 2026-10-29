@@ -19,6 +19,8 @@ export interface ExclusionTarget {
 	readonly nodeId: number;
 	/** Zero identifies a device outside this controller's network to the Driver. */
 	readonly callbackNodeId: number;
+	/** A foreign learning device may acknowledge on its previous network. */
+	readonly acknowledgementHomeId?: number;
 	readonly nodeInformation: NodeInformationFrame;
 }
 
@@ -49,6 +51,8 @@ export function getExclusionTarget(
 			nodeId: mpdu.sourceNodeId,
 			callbackNodeId:
 				mpdu.homeId === controller.homeId ? mpdu.sourceNodeId : 0,
+			acknowledgementHomeId:
+				mpdu.homeId === controller.homeId ? undefined : mpdu.homeId,
 			nodeInformation: parseOverAirNodeInformationFrame(
 				mpdu.payload.subarray(2),
 			),

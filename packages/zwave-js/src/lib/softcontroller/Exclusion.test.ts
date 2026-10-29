@@ -64,6 +64,7 @@ test.each([
 
 		expect(target?.nodeId).toBe(9);
 		expect(target?.callbackNodeId).toBe(0);
+		expect(target?.acknowledgementHomeId).toBe(nifOptions.homeId);
 		expect(target?.nodeInformation.genericDeviceClass).toBe(0x10);
 		expect(target?.nodeInformation.supportedCCs).toEqual([0x5e, 0x98]);
 	},
@@ -71,18 +72,19 @@ test.each([
 
 test("a foreign numeric collision is never reported as a local node", () => {
 	for (const sourceNodeId of [controller.ownNodeId, 2, 9, 232]) {
-		expect(
-			getExclusionTarget(nif({ sourceNodeId }), controller)
-				?.callbackNodeId,
-		).toBe(0);
+		const target = getExclusionTarget(nif({ sourceNodeId }), controller);
+		expect(target?.callbackNodeId).toBe(0);
+		expect(target?.acknowledgementHomeId).toBe(nifOptions.homeId);
 	}
 });
 
 test("retains the local identity for a NIF on this network", () => {
-	expect(
-		getExclusionTarget(nif({ homeId: controller.homeId }), controller)
-			?.callbackNodeId,
-	).toBe(9);
+	const target = getExclusionTarget(
+		nif({ homeId: controller.homeId }),
+		controller,
+	);
+	expect(target?.callbackNodeId).toBe(9);
+	expect(target?.acknowledgementHomeId).toBeUndefined();
 });
 
 test("ignores the actual controller and reserved or unassigned node IDs", () => {

@@ -33,6 +33,15 @@ errors trigger the same receiver cleanup; shutdown and fault cleanup disable MAC
 instead of re-enabling normal traffic. Ordinary `send` results still report
 transmit completion, independently of a later application response.
 
+Capabilities describe implemented contracts. They do not follow from a
+manufacturer name, a guessed SDK version, or a successfully queued command.
+Unsupported SmartStart, Network Wide Inclusion, high-power overrides, and
+transmit cancellation remain disabled for the initial software controller.
+Missing node protocol information and unobserved links must not become
+invented device capabilities or routes.
+
+## Application response window
+
 Ordinary acknowledged direct application traffic retains reception on its
 transmit channel atomically when the radio finishes the MAC transaction. A
 successful transmit starts a bounded 250 ms idle response window; reports are
@@ -49,13 +58,6 @@ NOP, Protocol CC, routed and broadcast traffic retain their existing policy.
 The separate atomic wake-up-beam contract does not support a held response
 window, so a transmit requiring a beam is excluded. These software boundaries
 do not qualify routed or FLiRS response timing in hardware.
-
-Capabilities describe implemented contracts. They do not follow from a
-manufacturer name, a guessed SDK version, or a successfully queued command.
-Unsupported SmartStart, Network Wide Inclusion, high-power overrides, and
-transmit cancellation remain disabled for the initial software controller.
-Missing node protocol information and unobserved links must not become
-invented device capabilities or routes.
 
 ## Classic exclusion
 
@@ -95,6 +97,17 @@ network; see the [Silicon Labs protocol change notes](https://docs.silabs.com/z-
 This direct path does not implement Network Wide Exclusion or high-power
 overrides. Physical compatibility still requires validation with the device
 and radio backend being used.
+
+### Foreign-network ACK identity
+
+The leaving device's previous Home ID is passed separately as an additional
+accepted ACK identity, alongside the transmitted frame's Home ID. The
+transmitted Assign IDs still uses the controller's
+Home ID and a forced direct route, without borrowing local routes or beaming
+state for a numerically matching node. The optional radio capability
+`foreignHomeIdAcknowledgement` must be negotiated before this transmit; an
+unsupported backend fails closed instead of ignoring the expected ACK Home ID.
+This option never fabricates an ACK or changes the success criteria.
 
 ## Controller identity and firmware
 

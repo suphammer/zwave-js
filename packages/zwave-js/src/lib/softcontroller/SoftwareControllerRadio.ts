@@ -36,6 +36,8 @@ export interface SoftwareControllerRadioCapabilities {
 	routedAckStatus: true;
 	explorerTx: boolean;
 	beamTx: boolean;
+	/** Can match a direct link ACK on an explicitly selected different Home ID. */
+	foreignHomeIdAcknowledgement?: boolean;
 }
 
 export type SoftwareControllerBeamMode = "250ms" | "1000ms";
@@ -45,7 +47,12 @@ export interface SoftwareControllerRadioConfiguration extends ControllerIdentity
 	autoAck: boolean;
 }
 
-export interface SoftwareControllerRadioTransmitRequest {
+export interface SoftwareControllerRadioTransmitOptions {
+	/** Additional accepted ACK Home ID, alongside the transmitted MPDU's Home ID. */
+	acknowledgementHomeId?: number;
+}
+
+export interface SoftwareControllerRadioTransmitRequest extends SoftwareControllerRadioTransmitOptions {
 	mpdu: BytesView;
 	channel: number;
 	txPowerDeciDbm?: number;
