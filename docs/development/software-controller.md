@@ -79,6 +79,33 @@ This direct path does not implement Network Wide Exclusion or high-power
 overrides. Physical compatibility still requires validation with the device
 and radio backend being used.
 
+## Controller identity and firmware
+
+The optional `SoftwareControllerRadio.firmwareInfo` metadata passes through the
+shared backend to `Driver.controllerFirmwareInfo`. It contains only strings and
+is returned as a detached snapshot. Discovery and shutdown determine its
+availability; it is not stored in the network database or inferred from a cached
+controller node. Radio implementations without metadata remain supported.
+
+Suphacap reports the local display manufacturer **Suphammer**, product
+**Suphacap 2**, and firmware profile `rcp-controller`. Its firmware version comes
+from the running radio's standard RCP `GetFirmwareInfo` response. These display
+names do not allocate Z-Wave numeric IDs. The internal compatibility layer still
+uses reserved/unassigned Manufacturer ID `0xffff`, Product Type `0`, and Product
+ID `0`; those values are not a private Suphammer allocation and must not be used
+to identify other nodes or create device database entries. Official manufacturer
+identity requires an assigned ID from the Z-Wave manufacturer list.
+
+`lib/suphacap/Firmware.ts` defines the Driver's minimum compatible firmware
+(`0.1.4`) and recommended source baseline (`0.1.5`). Startup requires both the
+minimum version and the negotiated MAC-assist version 1/capability mask `0x33`.
+Explorer TX and beaming remain separately negotiated. An older version produces
+an error naming the observed and required versions; newer compatible firmware
+is accepted. A version below the recommended baseline can remain compatible,
+so applications should present it as an update recommendation rather than a
+startup failure. The baseline is not a claim about the latest online release
+or the Silicon Labs Z-Wave SDK version.
+
 ## Adding another radio
 
 A radio implementation supplies the `SoftwareControllerRadio` contract and

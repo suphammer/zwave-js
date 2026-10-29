@@ -19,6 +19,7 @@ import {
 } from "@zwave-js/serial";
 import { Bytes, type BytesView } from "@zwave-js/shared";
 
+import type { ControllerFirmwareInfo } from "../driver/ControllerFirmwareInfo.js";
 import type { RCPHost, PartialRCPHostOptions } from "../rcp/RCPHost.js";
 import { ControllerTransmitStatus } from "../softcontroller/ControllerBackend.js";
 import type {
@@ -32,6 +33,7 @@ import type {
 	SoftwareControllerRadioTransmitResult,
 } from "../softcontroller/SoftwareControllerRadio.js";
 
+import { getSuphacapControllerFirmwareInfo } from "./Firmware.js";
 import { SuphacapRCPHost } from "./RCPHost.js";
 
 const RCP_FUNC_MAC_ASSIST = 0x80 as RCPFunctionType;
@@ -179,6 +181,7 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 	readonly #startupCleanupErrors: unknown[] = [];
 	#host: RCPHost | undefined;
 	#regionConfig: SoftwareControllerRegionConfig | undefined;
+	#firmwareInfo: ControllerFirmwareInfo | undefined;
 	#onMPDU: Parameters<SoftwareControllerRadio["start"]>[0] | undefined;
 	#onError: ((error: unknown) => void) | undefined;
 	#firmwareMacCapabilities = 0;
@@ -211,6 +214,10 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 					& MAC_CAP_DIRECT_CONTINUOUS_BEAM_TX)
 				!== 0,
 		};
+	}
+
+	public get firmwareInfo(): ControllerFirmwareInfo | undefined {
+		return this.#firmwareInfo ? { ...this.#firmwareInfo } : undefined;
 	}
 
 	public async start(
@@ -256,7 +263,14 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 					"Suphacap RCP did not retain the requested RF region",
 				);
 			this.#regionConfig = config;
+			const firmwareInfo = getSuphacapControllerFirmwareInfo(
+				host.firmwareVersion,
+			);
 			await this.#queryCapabilities(host);
+			this.#firmwareInfo = firmwareInfo;
+			this.#diagnostic(
+				`${firmwareInfo.manufacturer} ${firmwareInfo.product} ${firmwareInfo.firmwareLabel} firmware ${firmwareInfo.firmwareVersion}; Driver requires >=${firmwareInfo.minimumVersion}, recommended baseline ${firmwareInfo.recommendedVersion}`,
+			);
 			host.on("mpdu received", onMPDU);
 			this.#faulted = false;
 			return config;
@@ -291,6 +305,7 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 		} finally {
 			this.#host = undefined;
 			this.#regionConfig = undefined;
+			this.#firmwareInfo = undefined;
 			this.#onMPDU = undefined;
 			this.#firmwareMacCapabilities = 0;
 		}

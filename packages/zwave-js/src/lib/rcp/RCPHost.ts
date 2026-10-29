@@ -266,6 +266,10 @@ export class RCPHost
 
 	private supportedFunctionTypes: MaybeNotKnown<RCPFunctionType[]>;
 	private rcpFirmwareVersion: MaybeNotKnown<string>;
+	/** Firmware version obtained from this radio's GetFirmwareInfo response. */
+	public get firmwareVersion(): MaybeNotKnown<string> {
+		return this.rcpFirmwareVersion;
+	}
 	private radioLibraryVersion: MaybeNotKnown<string>;
 	private radioLibrary: MaybeNotKnown<RadioLibrary>;
 
