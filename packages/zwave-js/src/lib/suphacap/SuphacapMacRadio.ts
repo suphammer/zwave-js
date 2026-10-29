@@ -52,6 +52,7 @@ const MAC_CAP_EXPLORER_TX = 0x04;
 const MAC_CAP_DIRECT_CONTINUOUS_BEAM_TX = 0x08;
 const MAC_CAP_EXPLORER_TARGET_REPLY = 0x10;
 const MAC_CAP_ROUTED_SILENT_ACK_STATUS = 0x20;
+const MAC_CAP_FOREIGN_HOME_TX = 0x40;
 const MAC_CAPS_REQUIRED =
 	MAC_CAP_AUTO_ACK
 	| MAC_CAP_TX_ACK
@@ -61,6 +62,7 @@ const MAC_CAPS_REQUIRED =
 const MAC_TRANSMIT_FLAG_CCA = 0x01;
 const MAC_TRANSMIT_FLAG_HOLD_RX = 0x02;
 const MAC_TRANSMIT_FLAG_ALTERNATE_RX = 0x04;
+const MAC_TRANSMIT_FLAG_FOREIGN_HOME = 0x08;
 const MAC_TRANSMIT_POWER_UNCHANGED = 0x7fff;
 const MAC_TRANSMIT_MAX_MPDU_LENGTH = 61;
 const MAC_BEAM_TRANSMIT_MAX_MPDU_LENGTH = 59;
@@ -181,6 +183,7 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 	readonly #startupCleanupErrors: unknown[] = [];
 	#host: RCPHost | undefined;
 	#regionConfig: SoftwareControllerRegionConfig | undefined;
+	#configuration: SoftwareControllerRadioConfiguration | undefined;
 	#firmwareInfo: ControllerFirmwareInfo | undefined;
 	#onMPDU: Parameters<SoftwareControllerRadio["start"]>[0] | undefined;
 	#onError: ((error: unknown) => void) | undefined;
@@ -207,6 +210,8 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 			localTransmitAck: true,
 			explorerTargetReply: true,
 			routedAckStatus: true,
+			foreignHomeIdAcknowledgement:
+				(this.#firmwareMacCapabilities & MAC_CAP_FOREIGN_HOME_TX) !== 0,
 			explorerTx:
 				(this.#firmwareMacCapabilities & MAC_CAP_EXPLORER_TX) !== 0,
 			beamTx:
@@ -305,6 +310,7 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 		} finally {
 			this.#host = undefined;
 			this.#regionConfig = undefined;
+			this.#configuration = undefined;
 			this.#firmwareInfo = undefined;
 			this.#onMPDU = undefined;
 			this.#firmwareMacCapabilities = 0;
@@ -349,6 +355,7 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 			|| payload[3] !== flags
 		)
 			throw new Error("Suphacap RCP rejected local MAC configuration");
+		this.#configuration = { ...configuration };
 	}
 
 	public async transmit(
@@ -378,6 +385,7 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 		if (request.beamMode) {
 			if (
 				!this.capabilities.beamTx
+				|| request.acknowledgementHomeId !== undefined
 				|| channel.dataRate !== ProtocolDataRate.ZWave_40k
 				|| request.holdRx
 				|| request.alternateRx
@@ -411,6 +419,9 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 		}
 		if (request.mpdu.length > this.limits.maximumMPDUSize)
 			return { status: ControllerTransmitStatus.Fail };
+		if (request.acknowledgementHomeId !== undefined) {
+			return this.#transmitForeignHome(request, txPower);
+		}
 		const flags =
 			(request.cca ? MAC_TRANSMIT_FLAG_CCA : 0)
 			| (request.holdRx ? MAC_TRANSMIT_FLAG_HOLD_RX : 0)
@@ -427,6 +438,89 @@ export class SuphacapMacRadio implements SoftwareControllerRadio {
 			request.mpdu,
 		]);
 		return this.#transmit(payload, maxAttempts);
+	}
+
+	async #transmitForeignHome(
+		request: SoftwareControllerRadioTransmitRequest,
+		txPower: number,
+	): Promise<SoftwareControllerRadioTransmitResult> {
+		const previous = this.#configuration;
+		const homeId = request.acknowledgementHomeId!;
+		const ownHome = previous && homeIdBytes(previous.homeId);
+		if (
+			!this.capabilities.foreignHomeIdAcknowledgement
+			|| !previous
+			|| !ownHome
+			|| !Number.isInteger(homeId)
+			|| homeId <= 0
+			|| homeId >= 0xffff_ffff
+			|| homeId === previous.homeId
+			|| request.holdRx
+			|| request.alternateRx
+			|| this.#regionConfig!.channelConfig
+				!== ChannelConfiguration.Classic
+			|| request.mpdu.length < 9
+			|| (request.mpdu[5] & 0xcf) !== 0x41
+			|| !request.mpdu
+				.subarray(0, 4)
+				.every((value, index) => value === ownHome[index])
+		) {
+			return { status: ControllerTransmitStatus.Fail };
+		}
+		let operationFailed = false;
+		let operationError: unknown;
+		let result: SoftwareControllerRadioTransmitResult = {
+			status: ControllerTransmitStatus.Fail,
+		};
+		try {
+			// Configure the additional accepted ACK Home ID. The MPDU retains this
+			// controller's own Home ID, and firmware still checks its source.
+			// Never auto-ACK traffic under the foreign network's identity.
+			await this.configure({
+				...previous,
+				homeId,
+				filterHomeId: true,
+				autoAck: false,
+			});
+			result = await this.#transmit(
+				Bytes.concat([
+					[
+						MAC_ASSIST_VERSION,
+						request.channel,
+						(txPower >>> 8) & 0xff,
+						txPower & 0xff,
+						MAC_TRANSMIT_FLAG_FOREIGN_HOME
+							| (request.cca ? MAC_TRANSMIT_FLAG_CCA : 0),
+						request.maxAttempts,
+					],
+					request.mpdu,
+				]),
+				request.maxAttempts,
+			);
+		} catch (error) {
+			operationFailed = true;
+			operationError = error;
+		}
+		// Restore before returning a status or rethrowing a transmit failure.
+		try {
+			await this.configure(
+				this.#faulted
+					? { ...previous, filterHomeId: false, autoAck: false }
+					: previous,
+			);
+		} catch (error) {
+			this.#faulted = true;
+			const failure = operationFailed
+				? new AggregateError(
+						[operationError, error],
+						"Foreign-home transmit and MAC restoration failed",
+					)
+				: error;
+			this.#reportError(failure);
+			throw failure;
+		}
+		if (operationFailed) throw operationError;
+		return result;
 	}
 
 	async #openHost(): Promise<RCPHost> {

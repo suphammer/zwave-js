@@ -11,7 +11,7 @@ import type { ControllerFirmwareInfo } from "../driver/ControllerFirmwareInfo.js
 // Raise the minimum only when the Driver depends on a newer firmware contract.
 export const SUPHACAP_RCP_MINIMUM_VERSION = "0.1.4";
 // This is the source baseline shipped with the Driver, not an online release check.
-export const SUPHACAP_RCP_RECOMMENDED_VERSION = "0.1.5";
+export const SUPHACAP_RCP_RECOMMENDED_VERSION = "0.1.6";
 
 export function getSuphacapControllerFirmwareInfo(
 	firmwareVersion: string | undefined,

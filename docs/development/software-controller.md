@@ -109,6 +109,14 @@ state for a numerically matching node. The optional radio capability
 unsupported backend fails closed instead of ignoring the expected ACK Home ID.
 This option never fabricates an ACK or changes the success criteria.
 
+Suphacap implements this contract with separately negotiated MAC capability
+`0x40` and private transmit flag `0x08`. It temporarily configures the additional
+ACK Home ID with automatic ACK disabled, leaves the MPDU's Home ID unchanged,
+and restores the previous configuration after the transaction. Fault cleanup
+keeps MAC disabled. The normal operational minimum remains `0x33`; firmware
+without `0x40` can still perform own-network exclusion, while foreign exclusion
+fails before transmission.
+
 ## Controller identity and firmware
 
 The optional `SoftwareControllerRadio.firmwareInfo` metadata passes through the
@@ -127,7 +135,7 @@ to identify other nodes or create device database entries. Official manufacturer
 identity requires an assigned ID from the Z-Wave manufacturer list.
 
 `lib/suphacap/Firmware.ts` defines the Driver's minimum compatible firmware
-(`0.1.4`) and recommended source baseline (`0.1.5`). Startup requires both the
+(`0.1.4`) and recommended source baseline (`0.1.6`). Startup requires both the
 minimum version and the negotiated MAC-assist version 1/capability mask `0x33`.
 Explorer TX and beaming remain separately negotiated. An older version produces
 an error naming the observed and required versions; newer compatible firmware
