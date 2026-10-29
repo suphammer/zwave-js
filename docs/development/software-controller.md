@@ -140,6 +140,11 @@ Driver. The operation sends at most two requests, adds no NOP or higher-rate TX
 probe, and does not change the ACK-confirmed preferred transmit channel from
 passive NIF reception or unacknowledged local transmit completion.
 
+At the Serial API boundary, `ApplicationUpdate(NodeInfo_RequestFailed)` (`0x81`)
+is a terminal unsuccessful callback for `RequestNodeInfo`. It rejects the
+request and releases the serial queue without waiting for the missing-callback
+timeout.
+
 Valid unsolicited NIFs from included, assigned Classic nodes also become the
 standard `ApplicationUpdate(NodeInfoReceived)` event. The upstream Driver then
 updates the node's Command Classes, marks an awake battery node accordingly,

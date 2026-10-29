@@ -151,6 +151,10 @@ export class ApplicationUpdateRequestNodeInfoRequestFailed
 	extends ApplicationUpdateRequest
 	implements SuccessIndicator
 {
+	public static from(): ApplicationUpdateRequestNodeInfoRequestFailed {
+		return new this();
+	}
+
 	isOK(): boolean {
 		return false;
 	}
