@@ -42,6 +42,7 @@ import {
 	type RawControllerTransport,
 } from "./ControllerBackend.js";
 import { generateRandomHomeId } from "./ControllerState.js";
+import { shouldSetSpeedModified } from "./DataRate.js";
 import { getExclusionTarget } from "./Exclusion.js";
 import {
 	isNodeInformationFrameForController,
@@ -1545,6 +1546,7 @@ export class SoftwareController implements RawControllerTransport {
 		alternateRx = false,
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
 		routeOverride?: readonly number[] | null,
+		speedModified = false,
 	): Promise<ControllerTransmitResult> {
 		if (this.#sendInFlight || this.#factoryDefaultOperation) {
 			return { status: ControllerTransmitStatus.NotIdle };
@@ -1558,6 +1560,7 @@ export class SoftwareController implements RawControllerTransport {
 			alternateRx,
 			routeOverride,
 			destinationBeamModeOverride,
+			speedModified,
 		);
 		this.#activeSend = operation;
 		try {
@@ -1576,6 +1579,7 @@ export class SoftwareController implements RawControllerTransport {
 		alternateRx: boolean,
 		routeOverride?: readonly number[] | null,
 		destinationBeamModeOverride?: SoftwareControllerBeamMode | null,
+		speedModified = false,
 	): Promise<ControllerTransmitResult> {
 		const destinationBeamMode =
 			destinationBeamModeOverride === undefined
@@ -1587,6 +1591,7 @@ export class SoftwareController implements RawControllerTransport {
 			homeId,
 			routeOverride,
 			destinationBeamMode,
+			speedModified,
 		);
 		if (this.#networkManagementSession) {
 			this.#diagnostic(
@@ -1878,6 +1883,19 @@ export class SoftwareController implements RawControllerTransport {
 			if (channel) return channel.channel;
 		}
 		return this.#normalized.channel;
+	}
+
+	#assignmentSpeedModified(
+		channel: number,
+		peerBitRates: readonly number[],
+	): boolean {
+		const channels = this.#regionConfig!.channels;
+		return shouldSetSpeedModified(
+			channels.find((candidate) => candidate.channel === channel)!
+				.dataRate,
+			channels.map((candidate) => candidate.dataRate),
+			peerBitRates,
+		);
 	}
 
 	#channelForDataRate(dataRate: ProtocolDataRate): number {
@@ -2587,6 +2605,14 @@ export class SoftwareController implements RawControllerTransport {
 				},
 				receiveChannel,
 				joiningHomeId,
+				false,
+				false,
+				undefined,
+				undefined,
+				this.#assignmentSpeedModified(
+					receiveChannel,
+					nodeInformation.supportedDataRates,
+				),
 			);
 			this.#diagnostic(
 				`Assign IDs transmit status ${assignResult.status} on channel ${receiveChannel}`,
@@ -2748,6 +2774,7 @@ export class SoftwareController implements RawControllerTransport {
 			target.callbackNodeId,
 			target.nodeInformation.nodeType,
 			info.channel,
+			target.nodeInformation.supportedDataRates,
 		);
 		const trackedOperation = operation.finally(() => {
 			if (session.operation === trackedOperation)
@@ -2762,6 +2789,7 @@ export class SoftwareController implements RawControllerTransport {
 		callbackNodeId: number,
 		nodeType: NodeType,
 		receiveChannel: number,
+		peerBitRates: readonly number[],
 	): Promise<void> {
 		try {
 			await session.ready;
@@ -2784,6 +2812,7 @@ export class SoftwareController implements RawControllerTransport {
 				false,
 				null,
 				null,
+				this.#assignmentSpeedModified(receiveChannel, peerBitRates),
 			);
 			if (result.status !== ControllerTransmitStatus.OK) {
 				throw new Error(
@@ -2898,6 +2927,7 @@ export class SoftwareController implements RawControllerTransport {
 		homeId = this.#normalized.homeId,
 		routeOverride?: readonly number[] | null,
 		destinationBeamMode?: SoftwareControllerBeamMode,
+		speedModified = false,
 	): Bytes {
 		const channel = this.#regionConfig!.channels.find(
 			(candidate) => candidate.channel === channelNumber,
@@ -2920,10 +2950,14 @@ export class SoftwareController implements RawControllerTransport {
 				request.destinationNodeId !== NODE_ID_BROADCAST
 				&& !!(request.transmitOptions & TRANSMIT_OPTION_ACK),
 			sequenceNumber,
-			// Direct inclusion and application frames use the selected PHY rate as
-			// advertised. The Speed Modified bit is for an explicit per-frame rate
-			// reduction; it is not a logical-channel selector.
-			speedModified: false,
+			// A learning NIF supplies peer capabilities before its network identity
+			// is stable. A reduced direct rate must be marked independently of the
+			// logical channel number (G.9959 §8.1.3.3.4).
+			speedModified:
+				speedModified
+				&& headerFormat === ProtocolHeaderFormat.Classic2Channel
+				&& !repeaters
+				&& request.destinationNodeId !== NODE_ID_BROADCAST,
 			payload: request.command,
 		};
 		const mpdu = repeaters

@@ -64,6 +64,15 @@ Own-network exclusions retain the actual node ID and persist the removal.
 Completion requires the radio's acknowledged Assign IDs result; queuing a
 transmission or observing an unrelated NIF is not exclusion evidence.
 
+Assign IDs during inclusion and exclusion marks the Classic Speed Modified
+header bit when its transmit rate is below the highest rate supported by both
+the radio and the peer's received NIF. For example, a 9.6 kbit/s assignment to
+a 40 kbit/s peer sets the bit. This follows
+[G.9959 §8.1.3.3.4](https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-G.9959-201501-I!!PDF-E&type=items);
+it does not change the selected rate or infer peer capabilities from an
+unrelated local node with the same numeric ID. Broadcast, routed, and ordinary
+application transmit policy are unchanged.
+
 Foreign exclusion does not use ordinary NOP verification on the controller's
 network; see the [Silicon Labs protocol change notes](https://docs.silabs.com/z-wave/7.24.0/zwave-api/).
 This direct path does not implement Network Wide Exclusion or high-power
