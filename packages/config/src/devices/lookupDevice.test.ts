@@ -1,4 +1,4 @@
-import { test } from "vitest";
+import { expect, test } from "vitest";
 
 import { ConfigManager } from "../ConfigManager.js";
 
@@ -13,6 +13,63 @@ test("Z-TRM3 with commandClasses.add compat should work", async (t) => {
 	t.expect(config).toBeDefined();
 	t.expect(config?.compat?.addCCs?.get(49)?.endpoints.size).toBe(3);
 }, 60000); // This test might take a while
+
+test.each([
+	["2.1", [10, 11, 12, 15, 30, 40, 42, 50, 51, 52, 70, 249]],
+	["2.1.0", [10, 11, 12, 15, 30, 40, 42, 50, 51, 52, 70, 249]],
+	["2.2", [11, 12, 30, 40, 42, 50, 51, 52, 70, 71, 72, 73, 74]],
+	["3.0", [11, 12, 30, 40, 42, 50, 51, 52, 70, 71, 72, 73, 74]],
+] as const)(
+	"Qubino Smart Plug 16A firmware %s parameters",
+	async (firmwareVersion, parameters) => {
+		const configManager = new ConfigManager();
+		const config = await configManager.lookupDevice(
+			0x0159,
+			0x0002,
+			0x0054,
+			firmwareVersion,
+		);
+
+		expect(config).toBeDefined();
+		expect(config?.firmwareVersion).toEqual({ min: "0.0", max: "255.255" });
+		expect(
+			[...config!.paramInformation!.keys()].map(
+				({ parameter }) => parameter,
+			),
+		).toEqual(parameters);
+
+		if (firmwareVersion === "2.1") {
+			const info = config!.paramInformation!;
+			expect(info.get({ parameter: 10 })).toMatchObject({
+				valueSize: 2,
+				defaultValue: 255,
+				allowManualEntry: false,
+				options: [
+					{ value: 0 },
+					{ value: 1 },
+					{ value: 2 },
+					{ value: 255 },
+				],
+			});
+			expect(info.get({ parameter: 15 })).toMatchObject({
+				valueSize: 1,
+				defaultValue: 0,
+				allowManualEntry: false,
+				options: [
+					{ label: "Seconds", value: 0 },
+					{ label: "Milliseconds", value: 1 },
+				],
+			});
+			expect(info.get({ parameter: 249 })).toMatchObject({
+				valueSize: 1,
+				defaultValue: 1,
+				allowManualEntry: false,
+				options: [{ value: 0 }, { value: 1 }],
+			});
+		}
+	},
+	60000,
+);
 
 test("Associations on endpoints should work - including imports", async (t) => {
 	// Logic Group ZDB5100

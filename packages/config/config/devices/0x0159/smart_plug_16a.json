@@ -14,6 +14,35 @@
 		"max": "255.255"
 	},
 	"paramInformation": [
+		// Firmware 2.1 is confirmed on S1 hardware, documented by manual v2.2 (2018-04-06):
+		// https://doc.eedomus.com/files/Qubino_Smart-Plug-16A-PLUS-extended-manual_eng_2.2-3.pdf
+		// The firmware boundary between S1 and S2 has not been established.
+		{
+			"#": "10",
+			"$if": "firmwareVersion === 2.1",
+			"label": "ALL ON/OFF Commands",
+			"valueSize": 2,
+			"defaultValue": 255,
+			"allowManualEntry": false,
+			"options": [
+				{
+					"label": "Disable all on and all off",
+					"value": 0
+				},
+				{
+					"label": "Enable all off only",
+					"value": 1
+				},
+				{
+					"label": "Enable all on only",
+					"value": 2
+				},
+				{
+					"label": "Enable all on and all off",
+					"value": 255
+				}
+			]
+		},
 		{
 			"#": "11",
 			"$purpose": "timer.auto_off",
@@ -44,6 +73,25 @@
 				{
 					"label": "Disabled",
 					"value": 0
+				}
+			]
+		},
+		{
+			"#": "15",
+			"$if": "firmwareVersion === 2.1",
+			"label": "Timer Unit",
+			"description": "Applies to the auto-on and auto-off timers (parameters 11 and 12).",
+			"valueSize": 1,
+			"defaultValue": 0,
+			"allowManualEntry": false,
+			"options": [
+				{
+					"label": "Seconds",
+					"value": 0
+				},
+				{
+					"label": "Milliseconds",
+					"value": 1
 				}
 			]
 		},
@@ -145,6 +193,7 @@
 		},
 		{
 			"#": "71",
+			"$if": "firmwareVersion !== 2.1",
 			"label": "Program Notifications: Power Threshold",
 			"description": "When the power consumption reaches this threshold, a program started notification will be sent to the controller.",
 			"valueSize": 2,
@@ -161,6 +210,7 @@
 		},
 		{
 			"#": "72",
+			"$if": "firmwareVersion !== 2.1",
 			"label": "Program Notifications: Time Interval",
 			"description": "When the power consumption drops below the power threshold for this long, a program completed notification will be sent to the controller.",
 			"valueSize": 1,
@@ -177,13 +227,22 @@
 		},
 		{
 			"#": "73",
+			"$if": "firmwareVersion !== 2.1",
 			"$import": "~/templates/master_template.json#base_enable_disable",
 			"label": "Program Notifications: Turn Plug Off After Completion"
 		},
 		{
 			"#": "74",
+			"$if": "firmwareVersion !== 2.1",
 			"$import": "~/templates/master_template.json#base_enable_disable",
 			"label": "LED Indicator",
+			"defaultValue": 1
+		},
+		{
+			"#": "249",
+			"$if": "firmwareVersion === 2.1",
+			"$import": "~/templates/master_template.json#base_enable_disable",
+			"label": "Report After Set",
 			"defaultValue": 1
 		}
 	]
