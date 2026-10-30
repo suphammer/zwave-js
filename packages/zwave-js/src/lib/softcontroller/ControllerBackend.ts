@@ -13,7 +13,11 @@ import type {
 	ZWaveSerialBinding,
 	ZWaveSerialBindingFactory,
 } from "@zwave-js/serial";
-import { encodeTXReport } from "@zwave-js/serial/serialapi";
+import {
+	RemoveFailedNodeStartFlags,
+	RemoveFailedNodeStatus,
+	encodeTXReport,
+} from "@zwave-js/serial/serialapi";
 import type { BytesView } from "@zwave-js/shared";
 
 import { isRandomHomeId } from "./ControllerState.js";
@@ -65,6 +69,25 @@ export interface ControllerRoutingInfoRequest {
 export interface ControllerReturnRouteRequest {
 	sourceNodeId: number;
 	destinationNodeId: number;
+}
+
+export type ControllerFailedNodeRemovalResult =
+	| "removed"
+	| "node-ok"
+	| "not-removed";
+
+export type ControllerFailedNodeRemovalStart =
+	| { status: "not-failed" | "busy" | "failed" }
+	| {
+			status: "started";
+			/** Rejection means an indeterminate outcome and must not become a success callback. */
+			result: Promise<ControllerFailedNodeRemovalResult>;
+	  };
+
+/** Failed-node removal requires fresh link evidence and a durable membership commit. */
+export interface ControllerFailedNodeManagement {
+	isFailedNode(nodeId: number): boolean;
+	removeFailedNode(nodeId: number): ControllerFailedNodeRemovalStart;
 }
 
 export interface ControllerApplicationFrame {
@@ -146,6 +169,11 @@ export interface ControllerNetworkManagement {
  * the transport implementation, where they can be handled deterministically.
  */
 export interface RawControllerTransport {
+	/**
+	 * Omit unless failure detection, responder checks, and durable removal are implemented.
+	 * stop() must await an in-flight durable commit before releasing network ownership.
+	 */
+	readonly failedNodeManagement?: ControllerFailedNodeManagement;
 	/**
 	 * Classic Explorer/base payload accepted by this backend. The Driver derives
 	 * AutoRoute and direct limits by adding 2 and 8 bytes respectively. Omit this
@@ -320,6 +348,12 @@ interface PendingNeighborUpdate {
 	callbackId: number;
 }
 
+interface PendingFailedNodeRemoval {
+	nodeId: number;
+	callbackId: number;
+	homeId: number;
+}
+
 interface PendingTransmit {
 	callbackId: number;
 	aborted: boolean;
@@ -451,7 +485,10 @@ function normalizeOptions(
 class ControllerBindingRuntime {
 	readonly #options: ControllerBindingOptions;
 	readonly #identity: ReturnType<typeof normalizeOptions>;
-	readonly #onControllerStateChanged: (state: ControllerBindingState) => void;
+	readonly #onControllerStateChanged: (
+		state: ControllerBindingState,
+		expectedHomeId?: number,
+	) => void;
 	readonly #includedNodeIds: Set<number>;
 	#homeId: number;
 	#ownNodeId: number;
@@ -463,6 +500,7 @@ class ControllerBindingRuntime {
 	#networkManagementSession: NetworkManagementSession | undefined;
 	#pendingNodeInfoRequest: PendingNodeInfoRequest | undefined;
 	#pendingNeighborUpdate: PendingNeighborUpdate | undefined;
+	#pendingFailedNodeRemoval: PendingFailedNodeRemoval | undefined;
 	readonly #pendingTransmits = new Set<PendingTransmit>();
 	#factoryDefaultInFlight = false;
 	#closed = false;
@@ -470,7 +508,10 @@ class ControllerBindingRuntime {
 
 	public constructor(
 		options: ControllerBindingOptions,
-		onControllerStateChanged: (state: ControllerBindingState) => void,
+		onControllerStateChanged: (
+			state: ControllerBindingState,
+			expectedHomeId?: number,
+		) => void,
 	) {
 		this.#options = options;
 		this.#identity = normalizeOptions(options);
@@ -526,6 +567,7 @@ class ControllerBindingRuntime {
 		this.#currentOutbound = undefined;
 		this.#networkManagementSession = undefined;
 		this.#pendingNeighborUpdate = undefined;
+		this.#pendingFailedNodeRemoval = undefined;
 		for (const pending of this.#pendingTransmits) pending.aborted = true;
 		this.#pendingTransmits.clear();
 		if (this.#pendingNodeInfoRequest) {
@@ -555,6 +597,7 @@ class ControllerBindingRuntime {
 	}
 
 	#handleHostBytes(bytes: Uint8Array<ArrayBufferLike>): void {
+		if (this.#closed) return;
 		for (const chunk of this.#decoder.push(bytes)) {
 			if (chunk.kind === "control") {
 				this.#handleHostControl(chunk.control);
@@ -609,7 +652,7 @@ class ControllerBindingRuntime {
 	}
 
 	async #handleHostFrame(frame: SerialApiFrame): Promise<void> {
-		if (frame.type !== SerialApiMessageType.Request) return;
+		if (this.#closed || frame.type !== SerialApiMessageType.Request) return;
 
 		switch (frame.functionType) {
 			case SerialApiFunction.GetSerialApiCapabilities:
@@ -681,6 +724,12 @@ class ControllerBindingRuntime {
 			case SerialApiFunction.RequestNodeInfo:
 				this.#handleRequestNodeInfo(frame.payload);
 				break;
+			case SerialApiFunction.IsFailedNode:
+				this.#handleIsFailedNode(frame.payload);
+				break;
+			case SerialApiFunction.RemoveFailedNode:
+				this.#handleRemoveFailedNode(frame.payload);
+				break;
 			case SerialApiFunction.SetApplicationNodeInformation:
 				// Unadvertised: the transport cannot change its over-air NIF. A
 				// forced request still receives the command's ACK-only completion.
@@ -717,6 +766,12 @@ class ControllerBindingRuntime {
 		}
 		if (this.#options.transport.factoryDefault) {
 			supportedFunctions.push(SerialApiFunction.HardReset);
+		}
+		if (this.#failedNodeManagement()) {
+			supportedFunctions.push(
+				SerialApiFunction.IsFailedNode,
+				SerialApiFunction.RemoveFailedNode,
+			);
 		}
 		if (this.#options.transport.abort) {
 			supportedFunctions.push(SerialApiFunction.SendDataAbort);
@@ -788,6 +843,147 @@ class ControllerBindingRuntime {
 		}
 	}
 
+	#failedNodeManagement(): ControllerFailedNodeManagement | undefined {
+		const management = this.#options.transport.failedNodeManagement;
+		return management
+			&& typeof management.isFailedNode === "function"
+			&& typeof management.removeFailedNode === "function"
+			? management
+			: undefined;
+	}
+
+	#handleIsFailedNode(payload: BytesView): void {
+		const nodeId = payload[0] ?? 0;
+		let failed = false;
+		if (
+			payload.length === 1
+			&& nodeId !== this.#ownNodeId
+			&& this.#includedNodeIds.has(nodeId)
+			&& !this.#factoryDefaultInFlight
+		) {
+			try {
+				failed =
+					this.#failedNodeManagement()?.isFailedNode(nodeId) === true;
+			} catch (error) {
+				this.#reportError(error);
+			}
+		}
+		this.#queueResponse(
+			SerialApiFunction.IsFailedNode,
+			Uint8Array.of(failed ? 1 : 0),
+		);
+	}
+
+	#handleRemoveFailedNode(payload: BytesView): void {
+		const nodeId = payload[0] ?? 0;
+		const callbackId = payload[1] ?? 0;
+		const management = this.#failedNodeManagement();
+		let flags: RemoveFailedNodeStartFlags | undefined;
+		if (payload.length !== 2 || !management) {
+			flags = RemoveFailedNodeStartFlags.RemoveFailed;
+		} else if (callbackId === 0) {
+			flags = RemoveFailedNodeStartFlags.NoCallbackFunction;
+		} else if (
+			nodeId === this.#ownNodeId
+			|| !this.#includedNodeIds.has(nodeId)
+		) {
+			flags = RemoveFailedNodeStartFlags.NodeNotFound;
+		} else if (
+			this.#pendingFailedNodeRemoval
+			|| this.#networkManagementSession
+			|| this.#factoryDefaultInFlight
+			|| this.#pendingNeighborUpdate
+			|| this.#pendingNodeInfoRequest
+			|| this.#pendingTransmits.size > 0
+		) {
+			flags = RemoveFailedNodeStartFlags.RemoveProcessBusy;
+		}
+		if (flags !== undefined || !management) {
+			this.#queueResponse(
+				SerialApiFunction.RemoveFailedNode,
+				Uint8Array.of(flags ?? RemoveFailedNodeStartFlags.RemoveFailed),
+			);
+			return;
+		}
+
+		const pending: PendingFailedNodeRemoval = {
+			nodeId,
+			callbackId,
+			homeId: this.#homeId,
+		};
+		this.#pendingFailedNodeRemoval = pending;
+		let start: ControllerFailedNodeRemovalStart;
+		try {
+			start = management.removeFailedNode(nodeId);
+		} catch (error) {
+			this.#pendingFailedNodeRemoval = undefined;
+			this.#reportError(error);
+			this.#queueResponse(
+				SerialApiFunction.RemoveFailedNode,
+				Uint8Array.of(RemoveFailedNodeStartFlags.RemoveFailed),
+			);
+			return;
+		}
+		if (start.status !== "started") {
+			this.#pendingFailedNodeRemoval = undefined;
+			this.#queueResponse(
+				SerialApiFunction.RemoveFailedNode,
+				Uint8Array.of(
+					start.status === "not-failed"
+						? RemoveFailedNodeStartFlags.NodeNotFound
+						: start.status === "busy"
+							? RemoveFailedNodeStartFlags.RemoveProcessBusy
+							: RemoveFailedNodeStartFlags.RemoveFailed,
+				),
+			);
+			return;
+		}
+
+		this.#queueResponse(
+			SerialApiFunction.RemoveFailedNode,
+			Uint8Array.of(RemoveFailedNodeStartFlags.OK),
+		);
+		void start.result.then(
+			(result) => {
+				if (this.#homeId !== pending.homeId) return;
+				let status: RemoveFailedNodeStatus;
+				switch (result) {
+					case "removed":
+						status = RemoveFailedNodeStatus.NodeRemoved;
+						this.#includedNodeIds.delete(nodeId);
+						// Durable removal remains authoritative when shutdown crossed the
+						// commit boundary. Only the closed wire callback is suppressed.
+						this.#publishControllerState(pending.homeId);
+						break;
+					case "node-ok":
+						status = RemoveFailedNodeStatus.NodeOK;
+						break;
+					case "not-removed":
+						status = RemoveFailedNodeStatus.NodeNotRemoved;
+						break;
+					default:
+						this.#reportError(
+							new Error("Invalid failed-node removal result"),
+						);
+						return;
+				}
+				if (this.#pendingFailedNodeRemoval !== pending || this.#closed)
+					return;
+				this.#pendingFailedNodeRemoval = undefined;
+				this.#queueFrame({
+					type: SerialApiMessageType.Request,
+					functionType: SerialApiFunction.RemoveFailedNode,
+					payload: Uint8Array.of(callbackId, status),
+				});
+			},
+			(error) => {
+				// Rejection may mean an uncertain durable commit. Retain ownership and
+				// withhold a callback rather than claiming either removal or rollback.
+				this.#reportError(error);
+			},
+		);
+	}
+
 	async #handleHardReset(payload: BytesView): Promise<void> {
 		const factoryDefault = this.#options.transport.factoryDefault?.bind(
 			this.#options.transport,
@@ -798,6 +994,7 @@ class ControllerBindingRuntime {
 			|| payload.length !== 1
 			|| callbackId === 0
 			|| this.#factoryDefaultInFlight
+			|| this.#pendingFailedNodeRemoval
 		) {
 			this.#reportError(
 				new Error(
@@ -837,14 +1034,17 @@ class ControllerBindingRuntime {
 		}
 	}
 
-	#publishControllerState(): void {
-		this.#onControllerStateChanged({
-			homeId: this.#homeId,
-			ownNodeId: this.#ownNodeId,
-			includedNodeIds: [...this.#includedNodeIds].toSorted(
-				(left, right) => left - right,
-			),
-		});
+	#publishControllerState(expectedHomeId?: number): void {
+		this.#onControllerStateChanged(
+			{
+				homeId: this.#homeId,
+				ownNodeId: this.#ownNodeId,
+				includedNodeIds: [...this.#includedNodeIds].toSorted(
+					(left, right) => left - right,
+				),
+			},
+			expectedHomeId,
+		);
 	}
 
 	#cancelPendingOperationsForFactoryDefault(): void {
@@ -975,6 +1175,7 @@ class ControllerBindingRuntime {
 			|| nodeId === this.#ownNodeId
 			|| !this.#includedNodeIds.has(nodeId)
 			|| this.#pendingNeighborUpdate
+			|| this.#pendingFailedNodeRemoval
 			|| this.#networkManagementSession
 			|| this.#factoryDefaultInFlight
 		) {
@@ -1037,6 +1238,7 @@ class ControllerBindingRuntime {
 			|| !this.#includedNodeIds.has(sourceNodeId)
 			|| !this.#includedNodeIds.has(destinationNodeId)
 			|| this.#pendingNeighborUpdate
+			|| this.#pendingFailedNodeRemoval
 			|| this.#networkManagementSession
 			|| this.#factoryDefaultInFlight
 		) {
@@ -1088,6 +1290,7 @@ class ControllerBindingRuntime {
 			|| sourceNodeId === this.#ownNodeId
 			|| !this.#includedNodeIds.has(sourceNodeId)
 			|| this.#pendingNeighborUpdate
+			|| this.#pendingFailedNodeRemoval
 			|| this.#networkManagementSession
 			|| this.#factoryDefaultInFlight
 		) {
@@ -1149,6 +1352,7 @@ class ControllerBindingRuntime {
 			|| nodeId === this.#ownNodeId
 			|| !this.#includedNodeIds.has(nodeId)
 			|| this.#pendingNodeInfoRequest
+			|| this.#pendingFailedNodeRemoval
 			|| this.#factoryDefaultInFlight
 		) {
 			this.#queueResponse(
@@ -1374,6 +1578,7 @@ class ControllerBindingRuntime {
 			|| callbackId === 0
 			|| this.#networkManagementSession
 			|| this.#pendingNeighborUpdate
+			|| this.#pendingFailedNodeRemoval
 		) {
 			this.#emitNetworkManagementStatus(
 				SerialApiFunction.AddNodeToNetwork,
@@ -1632,6 +1837,7 @@ class ControllerBindingRuntime {
 			|| callbackId === 0
 			|| this.#networkManagementSession
 			|| this.#pendingNeighborUpdate
+			|| this.#pendingFailedNodeRemoval
 		) {
 			this.#emitNetworkManagementStatus(
 				SerialApiFunction.RemoveNodeFromNetwork,
@@ -1816,7 +2022,11 @@ class ControllerBindingRuntime {
 	}
 
 	#handleSendData(payload: BytesView): void {
-		if (this.#factoryDefaultInFlight || payload.length < 4) {
+		if (
+			this.#factoryDefaultInFlight
+			|| this.#pendingFailedNodeRemoval
+			|| payload.length < 4
+		) {
 			this.#queueResponse(SerialApiFunction.SendData, Uint8Array.of(0));
 			return;
 		}
@@ -1929,7 +2139,12 @@ export function createControllerBinding(
 				ownNodeId: state.ownNodeId,
 				includedNodeIds: state.includedNodeIds,
 			},
-			(nextState) => {
+			(nextState, expectedHomeId) => {
+				if (
+					expectedHomeId !== undefined
+					&& state.homeId !== expectedHomeId
+				)
+					return;
 				state = nextState;
 			},
 		);

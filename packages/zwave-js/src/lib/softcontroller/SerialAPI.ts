@@ -49,6 +49,8 @@ export enum SerialApiFunction {
 	RemoveNodeFromNetwork = 0x4b,
 	GetSUCNodeId = 0x56,
 	RequestNodeInfo = 0x60,
+	RemoveFailedNode = 0x61,
+	IsFailedNode = 0x62,
 	GetRoutingInfo = 0x80,
 }
 

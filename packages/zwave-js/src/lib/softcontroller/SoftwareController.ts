@@ -40,6 +40,9 @@ import {
 	ControllerTransmitStatus,
 	type ControllerApplicationFrame,
 	type ControllerExclusionEvent,
+	type ControllerFailedNodeManagement,
+	type ControllerFailedNodeRemovalStart,
+	type ControllerFailedNodeRemovalResult,
 	type ControllerIdentity,
 	type ControllerInclusionEvent,
 	type ControllerNetworkManagement,
@@ -96,6 +99,26 @@ const CONTROLLER_NEIGHBOR_DISCOVERY_DELAY_MS = 3_700;
 const CONTROLLER_ASSIGNMENT_SETTLE_MS = 250;
 const NODE_NEIGHBOR_UPDATE_TIMEOUT_MS = 10_000;
 const EXPLORER_RESULT_TIMEOUT_MS = 5_000;
+const FAILED_NODE_EVIDENCE_TTL_MS = 30_000;
+
+interface FailedNodeEvidence {
+	epoch: number;
+	observedAt: number;
+}
+
+interface FailedNodeRemovalOperation {
+	nodeId: number;
+	committing: boolean;
+	epoch: number;
+	activityGeneration: number | undefined;
+}
+
+interface NetworkFrameObservation {
+	directNeighbor?: boolean;
+	protocolInfo?: Bytes;
+	isRouting?: boolean;
+	receiveChannel?: number;
+}
 
 export interface SoftwareControllerState extends ControllerIdentity {
 	readonly includedNodeIds: readonly number[];
@@ -514,6 +537,13 @@ export class SoftwareController implements RawControllerTransport {
 	readonly #quarantinedNodeIds = new Set<number>();
 	readonly #nodeChannels = new Map<number, number>();
 	readonly #nodeReceiveChannels = new Map<number, number>();
+	readonly #failedNodeEvidence = new Map<number, FailedNodeEvidence>();
+	readonly #nodeActivityGeneration = new Map<number, number>();
+	#failedNodeRemoval: FailedNodeRemovalOperation | undefined;
+	readonly #deferredNetworkObservations = new Map<
+		number,
+		NetworkFrameObservation
+	>();
 	readonly #dataRateRecoveryAfter = new Map<number, number>();
 	readonly #nodeNeighbors = new Map<number, readonly number[]>();
 	readonly #nodeProtocolInfo = new Map<number, Bytes>();
@@ -595,11 +625,200 @@ export class SoftwareController implements RawControllerTransport {
 		}
 		if (options.onControllerStateChanged) {
 			this.factoryDefault = () => this.#resetToFactoryDefaults();
+			this.failedNodeManagement = {
+				isFailedNode: (nodeId) => this.#isFailedNode(nodeId),
+				removeFailedNode: (nodeId) =>
+					this.#beginFailedNodeRemoval(nodeId),
+			};
 		}
 	}
 
 	/** Advertised only when an atomic persistence callback was configured. */
 	public readonly factoryDefault?: () => Promise<ControllerIdentity>;
+	public readonly failedNodeManagement?: ControllerFailedNodeManagement;
+
+	#observeNodeActivity(nodeId: number): void {
+		if (
+			!this.#started
+			|| this.#faulted
+			|| this.#stopOperation
+			|| this.#factoryDefaultOperation
+			|| nodeId === this.#normalized.ownNodeId
+			|| !this.#includedNodeIds.has(nodeId)
+		)
+			return;
+		this.#failedNodeEvidence.delete(nodeId);
+		this.#nodeActivityGeneration.set(
+			nodeId,
+			(this.#nodeActivityGeneration.get(nodeId) ?? 0) + 1,
+		);
+	}
+
+	#isFailedNode(nodeId: number): boolean {
+		const evidence = this.#failedNodeEvidence.get(nodeId);
+		const age = evidence ? Date.now() - evidence.observedAt : -1;
+		return (
+			this.#started
+			&& !this.#faulted
+			&& !this.#persistenceError
+			&& !this.#stopOperation
+			&& !this.#factoryDefaultOperation
+			&& nodeId !== this.#normalized.ownNodeId
+			&& this.#includedNodeIds.has(nodeId)
+			&& evidence?.epoch === this.#networkStateEpoch
+			&& age >= 0
+			&& age < FAILED_NODE_EVIDENCE_TTL_MS
+		);
+	}
+
+	#beginFailedNodeRemoval(nodeId: number): ControllerFailedNodeRemovalStart {
+		if (
+			!this.#started
+			|| this.#faulted
+			|| this.#persistenceError
+			|| this.#stopOperation
+			|| this.#factoryDefaultOperation
+			|| this.#networkManagementSession
+			|| this.#sendInFlight
+			|| this.#applicationResponseRestore
+			|| this.#protocolCommandWaiter
+			|| this.#explorerResultWaiter
+			|| this.#failedNodeRemoval
+		)
+			return { status: "busy" };
+		if (!this.#isFailedNode(nodeId)) return { status: "not-failed" };
+		const removal: FailedNodeRemovalOperation = {
+			nodeId,
+			committing: false,
+			epoch: this.#networkStateEpoch,
+			activityGeneration: this.#nodeActivityGeneration.get(nodeId),
+		};
+		this.#failedNodeRemoval = removal;
+		this.#sendInFlight = true;
+		this.#applicationResponseWindow.cancel();
+		const result = Promise.resolve().then(() =>
+			this.#removeFailedNode(removal),
+		);
+		this.#activeSend = result;
+		return { status: "started", result };
+	}
+
+	async #removeFailedNode(
+		removal: FailedNodeRemovalOperation,
+	): Promise<ControllerFailedNodeRemovalResult> {
+		const { nodeId } = removal;
+		const epoch = removal.epoch;
+		const activity = removal.activityGeneration;
+		try {
+			if (!this.#canContinueSend(epoch)) return "not-removed";
+			if (activity !== this.#nodeActivityGeneration.get(nodeId))
+				return "node-ok";
+			const result = await this.#sendAcrossClassicChannels({
+				destinationNodeId: nodeId,
+				command: Uint8Array.of(0),
+				transmitOptions: TRANSMIT_OPTION_ACK,
+			});
+			if (!this.#canContinueSend(epoch)) return "not-removed";
+			if (
+				result.status === ControllerTransmitStatus.OK
+				|| activity !== this.#nodeActivityGeneration.get(nodeId)
+			) {
+				this.#failedNodeEvidence.delete(nodeId);
+				return "node-ok";
+			}
+			if (
+				result.status !== ControllerTransmitStatus.NoAck
+				|| !this.#canContinueSend(epoch)
+			)
+				return "not-removed";
+			await this.#persistenceTail;
+			if (!this.#canContinueSend(epoch)) return "not-removed";
+			if (activity !== this.#nodeActivityGeneration.get(nodeId))
+				return "node-ok";
+			if (this.#persistenceError) throw this.#persistenceError.error;
+			// The atomic write is the linearization boundary. Later RX is rebased
+			// onto its outcome and cannot queue a snapshot containing the retired ID.
+			removal.committing = true;
+			const state = this.#controllerStateWithoutNode(nodeId);
+			// A rejected flush may already have reached disk. No status can
+			// honestly claim either retained or removed membership in that case.
+			await this.#persistControllerState(state);
+			this.#forgetIncludedNode(nodeId);
+			return "removed";
+		} catch (error) {
+			this.#handleRadioError(error);
+			throw error;
+		} finally {
+			this.#failedNodeEvidence.delete(nodeId);
+			if (this.#failedNodeRemoval === removal)
+				this.#failedNodeRemoval = undefined;
+			this.#flushDeferredNetworkObservations();
+			await this.#persistenceTail;
+			if (this.#persistenceError) this.#faulted = true;
+			this.#sendInFlight = false;
+			this.#activeSend = undefined;
+		}
+	}
+
+	#controllerStateWithoutNode(nodeId: number): SoftwareControllerState {
+		const state = this.#controllerStateSnapshot();
+		return {
+			...state,
+			includedNodeIds: state.includedNodeIds.filter(
+				(id) => id !== nodeId,
+			),
+			nodeChannels: new Map(
+				[...state.nodeChannels].filter(([id]) => id !== nodeId),
+			),
+			nodeProtocolInfo: new Map(
+				[...state.nodeProtocolInfo].filter(([id]) => id !== nodeId),
+			),
+			repeaterNodeIds: new Set(
+				[...state.repeaterNodeIds].filter((id) => id !== nodeId),
+			),
+			nodeNeighbors: new Map(
+				[...state.nodeNeighbors]
+					.filter(([id]) => id !== nodeId)
+					.map(([id, neighbors]) => [
+						id,
+						neighbors.filter((neighbor) => neighbor !== nodeId),
+					]),
+			),
+			routes: new Map(
+				[...state.routes].filter(
+					([id, repeaters]) =>
+						id !== nodeId && !repeaters.includes(nodeId),
+				),
+			),
+		};
+	}
+
+	#forgetIncludedNode(nodeId: number): void {
+		this.#includedNodeIds.delete(nodeId);
+		this.#nodeChannels.delete(nodeId);
+		this.#nodeReceiveChannels.delete(nodeId);
+		this.#nodeProtocolInfo.delete(nodeId);
+		this.#repeaterNodeIds.delete(nodeId);
+		this.#directNeighborNodeIds.delete(nodeId);
+		this.#nodeNeighbors.delete(nodeId);
+		this.#routes.delete(nodeId);
+		this.#dataRateRecoveryAfter.delete(nodeId);
+		this.#flirsAwakeUntil.delete(nodeId);
+		this.#failedNodeEvidence.delete(nodeId);
+		this.#nodeActivityGeneration.delete(nodeId);
+		for (const [id, neighbors] of this.#nodeNeighbors) {
+			if (neighbors.includes(nodeId))
+				this.#nodeNeighbors.set(
+					id,
+					Object.freeze(
+						neighbors.filter((neighbor) => neighbor !== nodeId),
+					),
+				);
+		}
+		for (const [id, repeaters] of this.#routes) {
+			if (repeaters.includes(nodeId)) this.#routes.delete(id);
+		}
+	}
 
 	async #resetToFactoryDefaults(): Promise<ControllerIdentity> {
 		if (this.#factoryDefaultOperation) {
@@ -669,6 +888,9 @@ export class SoftwareController implements RawControllerTransport {
 			this.#quarantinedNodeIds.clear();
 			this.#nodeChannels.clear();
 			this.#nodeReceiveChannels.clear();
+			this.#failedNodeEvidence.clear();
+			this.#nodeActivityGeneration.clear();
+			this.#deferredNetworkObservations.clear();
 			this.#dataRateRecoveryAfter.clear();
 			this.#nodeNeighbors.clear();
 			this.#nodeProtocolInfo.clear();
@@ -1009,6 +1231,8 @@ export class SoftwareController implements RawControllerTransport {
 		this.#stopOperation = undefined;
 		this.#started = true;
 		this.#nodeReceiveChannels.clear();
+		this.#failedNodeEvidence.clear();
+		this.#nodeActivityGeneration.clear();
 		this.#directNeighborNodeIds.clear();
 		this.#onFrame = onFrame;
 		try {
@@ -1101,6 +1325,8 @@ export class SoftwareController implements RawControllerTransport {
 	async #stop(): Promise<void> {
 		this.#applicationResponseWindow.cancel();
 		this.#nodeReceiveChannels.clear();
+		this.#failedNodeEvidence.clear();
+		this.#nodeActivityGeneration.clear();
 		if (!this.#started) {
 			await this.#persistenceTail;
 			const errors = [...this.#startupCleanupErrors];
@@ -1298,10 +1524,42 @@ export class SoftwareController implements RawControllerTransport {
 		}
 
 		this.#sendInFlight = true;
+		const epoch = this.#networkStateEpoch;
+		const activity = this.#nodeActivityGeneration.get(
+			request.destinationNodeId,
+		);
+		const failedNodeProbe =
+			request.command.length === 1
+			&& request.command[0] === 0
+			&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0
+			&& request.destinationNodeId !== this.#normalized.ownNodeId
+			&& this.#includedNodeIds.has(request.destinationNodeId);
+		if (failedNodeProbe)
+			this.#failedNodeEvidence.delete(request.destinationNodeId);
 		const operation = this.#sendAcrossClassicChannels(request, false, true);
 		this.#activeSend = operation;
 		try {
-			return await operation;
+			const result = await operation;
+			if (
+				result.status === ControllerTransmitStatus.OK
+				&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0
+			)
+				this.#observeNodeActivity(request.destinationNodeId);
+			if (
+				failedNodeProbe
+				&& result.status === ControllerTransmitStatus.NoAck
+				&& this.#canContinueSend(epoch)
+				&& activity
+					=== this.#nodeActivityGeneration.get(
+						request.destinationNodeId,
+					)
+			) {
+				this.#failedNodeEvidence.set(request.destinationNodeId, {
+					epoch,
+					observedAt: Date.now(),
+				});
+			}
+			return result;
 		} finally {
 			this.#sendInFlight = false;
 			if (this.#activeSend === operation) this.#activeSend = undefined;
@@ -2963,6 +3221,8 @@ export class SoftwareController implements RawControllerTransport {
 			}
 
 			this.#includedNodeIds.add(nodeId);
+			this.#failedNodeEvidence.delete(nodeId);
+			this.#nodeActivityGeneration.delete(nodeId);
 			this.#nodeChannels.set(nodeId, nodeChannel!);
 			this.#nodeProtocolInfo.set(nodeId, Bytes.from(joiningProtocolInfo));
 			this.#directNeighborNodeIds.add(nodeId);
@@ -3114,6 +3374,8 @@ export class SoftwareController implements RawControllerTransport {
 				this.#quarantinedNodeIds.delete(nodeId);
 				this.#nodeChannels.delete(nodeId);
 				this.#nodeReceiveChannels.delete(nodeId);
+				this.#failedNodeEvidence.delete(nodeId);
+				this.#nodeActivityGeneration.delete(nodeId);
 				this.#dataRateRecoveryAfter.delete(nodeId);
 				this.#nodeProtocolInfo.delete(nodeId);
 				this.#flirsAwakeUntil.delete(nodeId);
@@ -3624,6 +3886,7 @@ export class SoftwareController implements RawControllerTransport {
 	readonly #handleMPDU = (mpdu: MPDU, info: MPDURxInfo): void => {
 		if (!this.#onFrame || this.#factoryDefaultOperation) return;
 		const belongsToNetwork = mpdu.homeId === this.#normalized.homeId;
+		if (belongsToNetwork) this.#observeNodeActivity(mpdu.sourceNodeId);
 		const mayObserveNetwork =
 			belongsToNetwork && this.#networkManagementSession === undefined;
 		if (mayObserveNetwork && this.#includedNodeIds.has(mpdu.sourceNodeId)) {
@@ -3698,52 +3961,7 @@ export class SoftwareController implements RawControllerTransport {
 			return;
 		if (mpdu.homeId !== this.#normalized.homeId) return;
 
-		if (
-			mpdu instanceof SinglecastZWaveMPDU
-			&& destination === this.#normalized.ownNodeId
-			&& this.#includedNodeIds.has(mpdu.sourceNodeId)
-		) {
-			this.#directNeighborNodeIds.add(mpdu.sourceNodeId);
-			if (
-				this.#rememberDirectedNeighbor(
-					mpdu.sourceNodeId,
-					this.#normalized.ownNodeId,
-				)
-			) {
-				void this.#persistControllerState().catch((error) =>
-					this.#reportError(error),
-				);
-			}
-		}
-		if (
-			isNodeInformationFrame
-			&& this.#includedNodeIds.has(mpdu.sourceNodeId)
-		) {
-			try {
-				const nodeInformation = parseOverAirNodeInformationFrame(
-					mpdu.payload.subarray(2),
-				);
-				this.#rememberNodeReceiveChannel(mpdu, info);
-				this.#nodeProtocolInfo.set(
-					mpdu.sourceNodeId,
-					protocolInfoFromNIF(
-						mpdu.payload.subarray(2),
-						nodeInformation,
-					),
-				);
-				this.#markFlirsAwake(mpdu.sourceNodeId);
-				if (nodeInformation.isRouting) {
-					this.#repeaterNodeIds.add(mpdu.sourceNodeId);
-				} else {
-					this.#repeaterNodeIds.delete(mpdu.sourceNodeId);
-				}
-				void this.#persistControllerState().catch((error) =>
-					this.#reportError(error),
-				);
-			} catch {
-				// ApplicationUpdate owns malformed-NIF reporting.
-			}
-		}
+		this.#observeNetworkFrame(mpdu, info, isNodeInformationFrame);
 
 		let frameType: ControllerApplicationFrame["frameType"] = "singlecast";
 		if (mpdu instanceof MulticastZWaveMPDU) {
@@ -3762,20 +3980,11 @@ export class SoftwareController implements RawControllerTransport {
 			frameType,
 			isExploreFrame: mpdu instanceof ExplorerZWaveMPDU,
 		};
-		if (
-			!isNodeInformationFrame
-			&& mpdu.payload.length >= 2
-			&& mpdu.payload[0] !== 0x00
-			&& mpdu.payload[0] !== PROTOCOL_CC
-			&& destination === this.#normalized.ownNodeId
-		) {
-			this.#rememberNodeReceiveChannel(mpdu, info);
-		}
 		if (this.#nodeInformationRequest?.accept(frame)) return;
 		this.#onFrame(frame);
 	};
 
-	#rememberNodeReceiveChannel(mpdu: MPDU, info: MPDURxInfo): void {
+	#receiveChannelForFrame(mpdu: MPDU, info: MPDURxInfo): number | undefined {
 		if (
 			!this.#started
 			|| this.#faulted
@@ -3795,12 +4004,121 @@ export class SoftwareController implements RawControllerTransport {
 			)
 		)
 			return;
-		this.#nodeReceiveChannels.set(mpdu.sourceNodeId, info.channel);
+		return info.channel;
+	}
+
+	#observeNetworkFrame(mpdu: MPDU, info: MPDURxInfo, isNIF: boolean): void {
+		if (
+			!this.#includedNodeIds.has(mpdu.sourceNodeId)
+			|| mpdu.sourceNodeId === this.#normalized.ownNodeId
+		)
+			return;
+		const observation: NetworkFrameObservation = {};
+		const destination = destinationNodeId(mpdu);
+		if (
+			mpdu instanceof SinglecastZWaveMPDU
+			&& destination === this.#normalized.ownNodeId
+		) {
+			observation.directNeighbor = true;
+		}
+		if (isNIF) {
+			try {
+				const nodeInformation = parseOverAirNodeInformationFrame(
+					mpdu.payload.subarray(2),
+				);
+				observation.protocolInfo = protocolInfoFromNIF(
+					mpdu.payload.subarray(2),
+					nodeInformation,
+				);
+				observation.isRouting = nodeInformation.isRouting;
+				observation.receiveChannel = this.#receiveChannelForFrame(
+					mpdu,
+					info,
+				);
+			} catch {
+				// ApplicationUpdate owns malformed-NIF reporting.
+			}
+		} else if (
+			destination === this.#normalized.ownNodeId
+			&& mpdu.payload.length >= 2
+			&& mpdu.payload[0] !== 0
+			&& mpdu.payload[0] !== PROTOCOL_CC
+		) {
+			observation.receiveChannel = this.#receiveChannelForFrame(
+				mpdu,
+				info,
+			);
+		}
+		if (this.#failedNodeRemoval?.committing) {
+			const previous =
+				this.#deferredNetworkObservations.get(mpdu.sourceNodeId) ?? {};
+			this.#deferredNetworkObservations.set(mpdu.sourceNodeId, {
+				...previous,
+				...observation,
+				directNeighbor:
+					previous.directNeighbor || observation.directNeighbor,
+				protocolInfo: observation.protocolInfo ?? previous.protocolInfo,
+				isRouting: observation.isRouting ?? previous.isRouting,
+				receiveChannel:
+					observation.receiveChannel ?? previous.receiveChannel,
+			});
+		} else this.#applyNetworkObservation(mpdu.sourceNodeId, observation);
+	}
+
+	#applyNetworkObservation(
+		nodeId: number,
+		observation: NetworkFrameObservation,
+		finishingCommit = false,
+	): void {
+		if (
+			!this.#includedNodeIds.has(nodeId)
+			|| this.#faulted
+			|| (!finishingCommit
+				&& (!this.#started
+					|| this.#stopOperation
+					|| this.#factoryDefaultOperation))
+		)
+			return;
+		let persist = false;
+		if (observation.directNeighbor) {
+			this.#directNeighborNodeIds.add(nodeId);
+			persist = !!this.#rememberDirectedNeighbor(
+				nodeId,
+				this.#normalized.ownNodeId,
+			);
+		}
+		if (observation.protocolInfo) {
+			this.#nodeProtocolInfo.set(nodeId, observation.protocolInfo);
+			if (this.#started && !this.#stopOperation)
+				this.#markFlirsAwake(nodeId);
+			if (observation.isRouting) this.#repeaterNodeIds.add(nodeId);
+			else this.#repeaterNodeIds.delete(nodeId);
+			persist = true;
+		}
+		if (
+			observation.receiveChannel !== undefined
+			&& this.#started
+			&& !this.#stopOperation
+		)
+			this.#nodeReceiveChannels.set(nodeId, observation.receiveChannel);
+		if (persist)
+			void this.#persistControllerState().catch((error) =>
+				this.#reportError(error),
+			);
+	}
+
+	#flushDeferredNetworkObservations(): void {
+		const observations = [...this.#deferredNetworkObservations];
+		this.#deferredNetworkObservations.clear();
+		for (const [nodeId, observation] of observations)
+			this.#applyNetworkObservation(nodeId, observation, true);
 	}
 
 	readonly #handleRadioError = (error: unknown): void => {
 		this.#applicationResponseWindow.cancel();
 		this.#nodeReceiveChannels.clear();
+		this.#failedNodeEvidence.clear();
+		this.#nodeActivityGeneration.clear();
 		this.#nodeInformationRequest?.cancel();
 		if (this.#networkManagementSession) {
 			this.#stopTransferPresentation(this.#networkManagementSession);

@@ -179,6 +179,44 @@ request ownership is released, and an invalid bounded transport result cannot
 leave a completed transport operation registered as pending. None of these
 updates promotes the ACK-confirmed preferred transmit PHY from passive RX.
 
+## Failed-node removal
+
+The optional generic failed-node contract implements Serial API `IsFailedNode`
+(`0x62`) and `RemoveFailedNode` (`0x61`) together. They are advertised only when
+the transport can durably update controller membership. `IsFailedNode` is a
+local query: it reports only explicit ACK-requested NOPs whose bounded normal
+transmit policy ended with `NoAck` within the last 30 seconds in the current
+network epoch. Application failures, local errors, `NotIdle`, sleeping status,
+and a partial interview do not establish failed-node evidence. Positive target
+traffic, reset, shutdown, or a radio fault clears that evidence.
+
+The public Driver removal API performs a fresh ping. An accepted backend
+removal also takes the transmit fence and performs another bounded idempotent
+NOP check. A responding node is retained. Own-node, broadcast, nonmember,
+invalid-callback, busy commissioning, and reset requests fail closed. No
+background task removes nodes, and no application command is replayed.
+
+After the final reachability and lifecycle checks, starting the atomic durable
+write is the removal's linearization boundary. The candidate removes only the
+target membership, protocol information, receive/transmit placement, and
+topology references. Other node IDs, network keys, and existing quarantined IDs
+are preserved. Successful removal releases the node ID normally; it does not
+add a quarantine entry or send exclusion/reset commands to the device.
+
+During that write, application frames still reach the Driver. Metadata updates
+are merged in a bounded per-member buffer and rebased onto the committed
+membership before further persistence, including when shutdown waits for the
+commit. They cannot enqueue a stale membership snapshot that resurrects the
+target. Target activity or shutdown before the boundary cancels removal; after
+the boundary a successful durable commit is reported honestly, even if late
+target traffic or shutdown races it. The standard callback then lets the
+ordinary Driver/UI node-removal handlers clean up the selected node.
+
+A rejected durable write may already have reached storage. The controller
+faults and reports the error, withholding a removal completion callback rather
+than claiming either retained or removed durable membership. It does not
+attempt to resolve uncertain storage with another write or automatic reset.
+
 ## End-node inclusion verification
 
 After Assign IDs, an end node's new identity is verified with an acknowledged,

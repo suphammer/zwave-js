@@ -45,6 +45,413 @@ import type {
 
 afterEach(() => vi.useRealTimers());
 
+async function failedRemovalFixture() {
+	const writes: SoftwareControllerState[] = [];
+	const committed: SoftwareControllerState[] = [];
+	let persist: (
+		state: SoftwareControllerState,
+	) => Promise<void> = async () => {};
+	const fixture = await responseRestoreFixture({
+		channel: 2,
+		includedNodeIds: [1, 2, 8],
+		quarantinedNodeIds: [3],
+		nodeChannels: new Map([
+			[2, 2],
+			[8, 1],
+		]),
+		nodeProtocolInfo: new Map([
+			[2, Bytes.from("539c01040701", "hex")],
+			[8, Bytes.from("539c01040701", "hex")],
+		]),
+		nodeNeighbors: new Map([
+			[1, [2, 8]],
+			[2, [1, 8]],
+			[8, [1, 2]],
+		]),
+		repeaterNodeIds: new Set([2, 8]),
+		routes: new Map([[8, [2]]]),
+		onControllerStateChanged: async (state) => {
+			writes.push(state);
+			await persist(state);
+			committed.push(state);
+		},
+	});
+	fixture.transmit.mockResolvedValue({
+		status: ControllerTransmitStatus.NoAck,
+	});
+	const management = fixture.controller.failedNodeManagement!;
+	const nop = { ...fixture.request, command: Bytes.from([0]) };
+	const receive = (
+		nodeId: number,
+		payload = Bytes.from("86148602", "hex"),
+		channel = 1,
+	) =>
+		fixture.receiveFrame(
+			new SinglecastZWaveMPDU({
+				homeId: 0x12345678,
+				sourceNodeId: nodeId,
+				destinationNodeId: 1,
+				ackRequested: false,
+				sequenceNumber: 1,
+				speedModified: false,
+				payload,
+			}),
+			{ channel, protocolDataRate: fixture.channels[channel].dataRate },
+		);
+	return {
+		...fixture,
+		management,
+		nop,
+		writes,
+		committed,
+		receive,
+		persist: (callback: typeof persist) => {
+			persist = callback;
+		},
+		establishFailure: async () => {
+			expect((await fixture.controller.send(nop)).status).toBe(
+				ControllerTransmitStatus.NoAck,
+			);
+			expect(management.isFailedNode(2)).toBe(true);
+			fixture.transmit.mockClear();
+		},
+		remove: () => {
+			const operation = management.removeFailedNode(2);
+			expect(operation.status).toBe("started");
+			if (operation.status !== "started")
+				throw Error("Removal did not start");
+			return operation.result;
+		},
+	};
+}
+
+test("failed-node management requires durable controller persistence", async () => {
+	const fixture = await responseRestoreFixture({
+		onControllerStateChanged: undefined,
+	});
+	try {
+		expect(fixture.controller.failedNodeManagement).toBeUndefined();
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("only a fresh explicit NOP NoAck establishes failed-node evidence", async () => {
+	const fixture = await failedRemovalFixture();
+	try {
+		await fixture.controller.send(fixture.request);
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		await fixture.controller.send({ ...fixture.nop, transmitOptions: 0 });
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		await fixture.establishFailure();
+		const observed = Date.now();
+		vi.setSystemTime(observed - 1);
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		vi.setSystemTime(observed + 29_999);
+		expect(fixture.management.isFailedNode(2)).toBe(true);
+		vi.setSystemTime(observed + 30_000);
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		expect(fixture.management.removeFailedNode(2)).toEqual({
+			status: "not-failed",
+		});
+		for (const nodeId of [0, 1, 3, 7, 255]) {
+			expect(fixture.management.isFailedNode(nodeId)).toBe(false);
+			expect(fixture.management.removeFailedNode(nodeId)).toEqual({
+				status: "not-failed",
+			});
+		}
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each([
+	ControllerTransmitStatus.Fail,
+	ControllerTransmitStatus.NotIdle,
+	ControllerTransmitStatus.NoRoute,
+])("local transmit status %i is not failed-node evidence", async (status) => {
+	const fixture = await failedRemovalFixture();
+	fixture.transmit.mockResolvedValue({ status });
+	try {
+		await fixture.controller.send(fixture.nop);
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		expect(fixture.management.removeFailedNode(2)).toEqual({
+			status: "not-failed",
+		});
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("positive target activity cannot be overwritten by a later NoAck completion", async () => {
+	const fixture = await failedRemovalFixture();
+	const terminal = createDeferredPromise<{
+		status: ControllerTransmitStatus;
+	}>();
+	fixture.transmit.mockImplementation(async () => terminal);
+	try {
+		const pending = fixture.controller.send(fixture.nop);
+		await Promise.resolve();
+		fixture.receive(2);
+		terminal.resolve({ status: ControllerTransmitStatus.NoAck });
+		await pending;
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		expect(fixture.management.removeFailedNode(2)).toEqual({
+			status: "not-failed",
+		});
+	} finally {
+		terminal.resolve({ status: ControllerTransmitStatus.NoAck });
+		await fixture.close();
+	}
+});
+
+test.each([0, 1])(
+	"only ACK-confirmed application success clears failed evidence (options=%i)",
+	async (transmitOptions) => {
+		const fixture = await failedRemovalFixture();
+		try {
+			await fixture.establishFailure();
+			fixture.transmit.mockResolvedValue({
+				status: ControllerTransmitStatus.OK,
+			});
+			await fixture.controller.send({
+				...fixture.request,
+				transmitOptions,
+			});
+			expect(fixture.management.isFailedNode(2)).toBe(
+				transmitOptions === 0,
+			);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("a responder at the backend recheck is retained and clears failed evidence", async () => {
+	const fixture = await failedRemovalFixture();
+	try {
+		await fixture.establishFailure();
+		fixture.transmit.mockResolvedValue({
+			status: ControllerTransmitStatus.OK,
+		});
+		expect(await fixture.remove()).toBe("node-ok");
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		expect(fixture.controller.getNodeProtocolInfo(2)).toBeDefined();
+		expect(
+			fixture.committed.every((state) =>
+				state.includedNodeIds.includes(2),
+			),
+		).toBe(true);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("target activity after acceptance but before the first probe retains the node", async () => {
+	const fixture = await failedRemovalFixture();
+	try {
+		await fixture.establishFailure();
+		const removing = fixture.remove();
+		fixture.receive(2);
+		expect(await removing).toBe("node-ok");
+		expect(fixture.transmit).not.toHaveBeenCalled();
+		expect(fixture.controller.getNodeProtocolInfo(2)).toBeDefined();
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("confirmed failed removal persists only the target and its topology references", async () => {
+	const fixture = await failedRemovalFixture();
+	try {
+		await fixture.establishFailure();
+		expect(await fixture.remove()).toBe("removed");
+		const state = fixture.committed.at(-1)!;
+		expect(state.includedNodeIds).toEqual([1, 8]);
+		expect(state.quarantinedNodeIds).toEqual([3]);
+		expect([...state.nodeChannels]).toEqual([[8, 1]]);
+		expect([...state.nodeProtocolInfo.keys()]).toEqual([8]);
+		expect([...state.repeaterNodeIds]).toEqual([8]);
+		expect([...state.nodeNeighbors]).toEqual([
+			[1, [8]],
+			[8, [1]],
+		]);
+		expect(state.routes.size).toBe(0);
+		expect(fixture.controller.getNodeProtocolInfo(2)).toBeUndefined();
+		expect(fixture.controller.getNodeProtocolInfo(8)).toEqual(
+			Bytes.from("539c01040701", "hex"),
+		);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each(["stop", "fault", "positive RX"])(
+	"%s before the removal write prevents retirement",
+	async (event) => {
+		const fixture = await failedRemovalFixture();
+		const terminal = createDeferredPromise<{
+			status: ControllerTransmitStatus;
+		}>();
+		let stopping: Promise<void> | undefined;
+		try {
+			// Lifecycle cleanup must not look like new positive target activity.
+			fixture.receive(2);
+			await fixture.establishFailure();
+			fixture.transmit.mockImplementation(async () => terminal);
+			const removing = fixture.remove();
+			await Promise.resolve();
+			expect(fixture.management.removeFailedNode(2)).toEqual({
+				status: "busy",
+			});
+			expect(
+				(
+					await fixture.controller.send({
+						...fixture.request,
+						destinationNodeId: 8,
+					})
+				).status,
+			).toBe(ControllerTransmitStatus.NotIdle);
+			if (event === "stop") stopping = fixture.controller.stop();
+			else if (event === "fault")
+				fixture.radioError(Error("radio failed"));
+			else fixture.receive(2);
+			terminal.resolve({ status: ControllerTransmitStatus.NoAck });
+			expect(await removing).toBe(
+				event === "positive RX" ? "node-ok" : "not-removed",
+			);
+			expect(fixture.writes).toHaveLength(0);
+			expect(fixture.controller.getNodeProtocolInfo(2)).toBeDefined();
+			await stopping;
+		} finally {
+			terminal.resolve({ status: ControllerTransmitStatus.NoAck });
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["normal", "stop", "late target RX"])(
+	"the durable commit rebases peer metadata without resurrecting the target (%s)",
+	async (event) => {
+		const fixture = await failedRemovalFixture();
+		const commit = createDeferredPromise<void>();
+		let stopping: Promise<void> | undefined;
+		try {
+			await fixture.establishFailure();
+			fixture.persist(async (state) => {
+				if (!state.includedNodeIds.includes(2)) await commit;
+			});
+			const removing = fixture.remove();
+			await vi.waitFor(() => expect(fixture.writes).toHaveLength(1));
+			fixture.receive(8, Bytes.from("0101d39c001001208672", "hex"));
+			fixture.receive(8);
+			expect(fixture.writes).toHaveLength(1);
+			expect(fixture.controller.getNodeProtocolInfo(8)).toEqual(
+				Bytes.from("539c01040701", "hex"),
+			);
+			if (event === "stop") stopping = fixture.controller.stop();
+			if (event === "late target RX") fixture.receive(2);
+			commit.resolve();
+			expect(await removing).toBe("removed");
+			await stopping;
+			expect(fixture.committed.length).toBeGreaterThan(1);
+			expect(
+				fixture.committed.every(
+					(state) => !state.includedNodeIds.includes(2),
+				),
+			).toBe(true);
+			expect(fixture.committed.at(-1)!.nodeProtocolInfo.get(8)).toEqual(
+				Bytes.from("d39c00041001", "hex"),
+			);
+			expect(fixture.committed.at(-1)!.nodeChannels.get(8)).toBe(1);
+			expect(fixture.committed.at(-1)!.quarantinedNodeIds).toEqual([3]);
+		} finally {
+			commit.resolve();
+			await fixture.close();
+		}
+	},
+);
+
+test("a write-then-reject outcome faults instead of reporting retained or removed membership", async () => {
+	const fixture = await failedRemovalFixture();
+	const error = Error("flush outcome uncertain");
+	let possibleDiskState: SoftwareControllerState | undefined;
+	try {
+		await fixture.establishFailure();
+		fixture.persist(async (state) => {
+			possibleDiskState = state;
+			throw error;
+		});
+		await expect(fixture.remove()).rejects.toBe(error);
+		expect(fixture.writes.at(-1)!.includedNodeIds).toEqual([1, 8]);
+		expect(possibleDiskState!.includedNodeIds).toEqual([1, 8]);
+		expect(fixture.committed).toHaveLength(0);
+		expect(fixture.controller.getNodeProtocolInfo(2)).toBeDefined();
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		expect(
+			(
+				await fixture.controller.send({
+					...fixture.request,
+					destinationNodeId: 8,
+				})
+			).status,
+		).toBe(ControllerTransmitStatus.Fail);
+		expect(fixture.management.removeFailedNode(2)).toEqual({
+			status: "busy",
+		});
+		expect(fixture.errors).toContain(error);
+	} finally {
+		await expect(fixture.close()).rejects.toBeInstanceOf(AggregateError);
+	}
+	await expect(fixture.controller.start(() => {})).rejects.toMatchObject({
+		errors: [error],
+	});
+});
+
+test("commissioning prevents failed-node removal without consuming its evidence", async () => {
+	const fixture = await failedRemovalFixture();
+	try {
+		await fixture.establishFailure();
+		fixture.transmit.mockResolvedValue({
+			status: ControllerTransmitStatus.OK,
+		});
+		await fixture.controller.networkManagement.beginInclusion(
+			{ nodeType: "any", highPower: false, networkWide: false },
+			() => {},
+		);
+		expect(fixture.management.removeFailedNode(2)).toEqual({
+			status: "busy",
+		});
+		await fixture.controller.networkManagement.stopInclusion();
+		expect(fixture.management.isFailedNode(2)).toBe(true);
+		expect(fixture.controller.getNodeProtocolInfo(2)).toBeDefined();
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("factory default blocks removal and invalidates the old failed-node epoch", async () => {
+	const fixture = await failedRemovalFixture();
+	const commit = createDeferredPromise<void>();
+	try {
+		await fixture.establishFailure();
+		fixture.persist(async () => commit);
+		const resetting = fixture.controller.factoryDefault!();
+		expect(fixture.management.removeFailedNode(2)).toEqual({
+			status: "busy",
+		});
+		commit.resolve();
+		await resetting;
+		expect(fixture.management.isFailedNode(2)).toBe(false);
+		expect(fixture.management.removeFailedNode(2)).toEqual({
+			status: "not-failed",
+		});
+	} finally {
+		commit.resolve();
+		await fixture.close();
+	}
+});
+
 test("preserves an omitted inclusion channel for the 9.6 kbit/s default", () => {
 	expect(normalizeInclusionChannel(undefined)).toBeUndefined();
 });
