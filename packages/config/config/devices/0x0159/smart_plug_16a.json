@@ -245,5 +245,10 @@
 			"label": "Report After Set",
 			"defaultValue": 1
 		}
-	]
+	],
+	"compat": {
+		"$if": "firmwareVersion === 2.1",
+		// Firmware 2.1 reports an OFF target even when the current value is ON and duration is zero.
+		"normalizeBinarySwitchIdleTarget": true
+	}
 }

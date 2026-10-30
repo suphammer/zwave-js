@@ -15,12 +15,14 @@ test("Z-TRM3 with commandClasses.add compat should work", async (t) => {
 }, 60000); // This test might take a while
 
 test.each([
+	["2.0", [11, 12, 30, 40, 42, 50, 51, 52, 70, 71, 72, 73, 74]],
 	["2.1", [10, 11, 12, 15, 30, 40, 42, 50, 51, 52, 70, 249]],
 	["2.1.0", [10, 11, 12, 15, 30, 40, 42, 50, 51, 52, 70, 249]],
+	["2.1.1", [11, 12, 30, 40, 42, 50, 51, 52, 70, 71, 72, 73, 74]],
 	["2.2", [11, 12, 30, 40, 42, 50, 51, 52, 70, 71, 72, 73, 74]],
 	["3.0", [11, 12, 30, 40, 42, 50, 51, 52, 70, 71, 72, 73, 74]],
 ] as const)(
-	"Qubino Smart Plug 16A firmware %s parameters",
+	"Qubino Smart Plug 16A firmware %s configuration",
 	async (firmwareVersion, parameters) => {
 		const configManager = new ConfigManager();
 		const config = await configManager.lookupDevice(
@@ -32,6 +34,11 @@ test.each([
 
 		expect(config).toBeDefined();
 		expect(config?.firmwareVersion).toEqual({ min: "0.0", max: "255.255" });
+		expect(config?.compat?.normalizeBinarySwitchIdleTarget).toBe(
+			firmwareVersion === "2.1" || firmwareVersion === "2.1.0"
+				? true
+				: undefined,
+		);
 		expect(
 			[...config!.paramInformation!.keys()].map(
 				({ parameter }) => parameter,
