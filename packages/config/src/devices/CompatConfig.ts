@@ -404,6 +404,19 @@ compat option mapRootReportsToEndpoint must be a positive integer!`,
 			this.mapRootReportsToEndpoint = definition.mapRootReportsToEndpoint;
 		}
 
+		if (definition.normalizeBinarySwitchIdleTarget != undefined) {
+			if (definition.normalizeBinarySwitchIdleTarget !== true) {
+				throwInvalidConfig(
+					"devices",
+					`config/devices/${filename}:
+compat option normalizeBinarySwitchIdleTarget must be true or omitted`,
+				);
+			}
+
+			this.normalizeBinarySwitchIdleTarget =
+				definition.normalizeBinarySwitchIdleTarget;
+		}
+
 		if (definition.overrideFloatEncoding != undefined) {
 			if (!isObject(definition.overrideFloatEncoding)) {
 				throwInvalidConfig(
@@ -639,6 +652,7 @@ compat option overrideQueries must be an object!`,
 	public readonly mapRootReportsToEndpoint?: number;
 	public readonly mapBasicReport?: BasicReportMapping;
 	public readonly mapBasicSet?: BasicSetMapping;
+	public readonly normalizeBinarySwitchIdleTarget?: boolean;
 	public readonly overrideFloatEncoding?: {
 		size?: number;
 		precision?: number;
@@ -685,6 +699,7 @@ compat option overrideQueries must be an object!`,
 			"mapBasicReport",
 			"mapBasicSet",
 			"mapRootReportsToEndpoint",
+			"normalizeBinarySwitchIdleTarget",
 			"overrideFloatEncoding",
 			"overrideQueries",
 			"reportTimeout",

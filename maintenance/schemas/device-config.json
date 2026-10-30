@@ -868,6 +868,9 @@
 					"type": "number",
 					"minimum": 1
 				},
+				"normalizeBinarySwitchIdleTarget": {
+					"const": true
+				},
 				"overrideFloatEncoding": {
 					"type": "object",
 					"properties": {

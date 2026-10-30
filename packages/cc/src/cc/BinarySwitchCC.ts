@@ -408,6 +408,17 @@ export class BinarySwitchCCReport extends BinarySwitchCC {
 		if (raw.payload.length >= 3) {
 			targetValue = parseMaybeBoolean(raw.payload[1]);
 			duration = Duration.parseReport(raw.payload[2]);
+			if (
+				ctx.getDeviceConfig?.(ctx.sourceNodeId)?.compat
+					?.normalizeBinarySwitchIdleTarget === true
+				&& typeof currentValue === "boolean"
+				&& typeof targetValue === "boolean"
+				&& currentValue !== targetValue
+				&& duration?.toMilliseconds() === 0
+			) {
+				// Some firmware reports a stale target despite reporting no transition.
+				targetValue = currentValue;
+			}
 		}
 
 		return new this({

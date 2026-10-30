@@ -545,6 +545,12 @@ Some legacy devices emit an NIF when a local event occurs (e.g. a button press) 
 
 Some multi-channel devices incorrectly report state changes for one of their endpoints via the root device, however there is no way to automatically detect for which endpoint these reports are meant. The flag `mapRootReportsToEndpoint` can be used to specify which endpoint these reports are mapped to. Without this flag, reports to the root device are silently ignored, unless `preserveRootApplicationCCValueIDs` is `true`.
 
+### `normalizeBinarySwitchIdleTarget`
+
+Some devices report a Binary Switch target value that contradicts the current value even though the remaining duration is zero. Set this flag to `true` only for affected devices and firmware versions. When both values are known booleans and the reported duration is known to be zero, Z-Wave JS replaces a contradictory target value with the reported current value. Reports with a nonzero or unknown duration, unknown values, or no target value retain their normal behavior.
+
+This changes the interpretation of received reports. It does not change outgoing commands, verify relay operation, or fix delivery failures.
+
 ### `overrideQueries`
 
 A frequent reason for device not "working" correctly is that they respond to queries incorrectly, e.g. RGB bulbs not reporting support for the blue color channel, or thermostats reporting the wrong supported modes. Using `overrideQueries`, the responses to these queries can be overridden, so they are not queried from the device anymore. Example:
