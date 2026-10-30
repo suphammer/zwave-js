@@ -818,6 +818,344 @@ async function rateRecoveryFixture(
 	return { ...fixture, saved, frames };
 }
 
+async function explorerReceiveFixture() {
+	const fixture = await rateRecoveryFixture({
+		channel: 1,
+		includedNodeIds: [1, 2, 7],
+		nodeChannels: new Map([[2, 1]]),
+		nodeProtocolInfo: new Map(),
+	});
+	fixture.radio.capabilities.explorerTx = true;
+	let heldChannel: number | undefined;
+	let explorer: NormalExplorerZWaveMPDU | undefined;
+	let sentAt = 0;
+	let terminal: () => Promise<ControllerTransmitResult> = async () => ({
+		status: ControllerTransmitStatus.OK,
+	});
+	fixture.configure.mockImplementation(async () => {
+		heldChannel = undefined;
+	});
+	fixture.transmit.mockImplementation(async (tx) => {
+		heldChannel = tx.holdRx ? tx.channel : undefined;
+		const frame = MPDU.parse(tx.mpdu, {
+			region: RFRegion.Europe,
+			protocolDataRate: fixture.channels[tx.channel].dataRate,
+		});
+		if (!(frame instanceof NormalExplorerZWaveMPDU))
+			return { status: ControllerTransmitStatus.NoAck };
+		explorer = frame;
+		sentAt = Date.now();
+		return terminal();
+	});
+	return {
+		...fixture,
+		get heldChannel() {
+			return heldChannel;
+		},
+		get sentAt() {
+			return sentAt;
+		},
+		setTerminal: (callback: typeof terminal) => {
+			terminal = callback;
+		},
+		send: () =>
+			fixture.controller.send({
+				...fixture.request,
+				command: Bytes.from([0]),
+				transmitOptions: 0x25,
+			}),
+		waitForExplorer: async () =>
+			vi.waitFor(() => expect(explorer).toBeDefined()),
+		reply: (overrides: Partial<SearchResultExplorerZWaveMPDU> = {}) => {
+			if (!explorer || heldChannel !== 1) return false;
+			fixture.receiveFrame(
+				new SearchResultExplorerZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					ackRequested: false,
+					sequenceNumber: 7,
+					headerType: MPDUHeaderType.Explorer,
+					routed: false,
+					speedModified: false,
+					version: 1,
+					command: ExplorerFrameCommand.SearchResult,
+					stop: false,
+					sourceRouted: false,
+					direction: "inbound",
+					randomTXInterval: 0,
+					ttl: 4,
+					repeaters: [],
+					searchingNodeId: 1,
+					frameHandle: explorer.sequenceNumber,
+					resultTTL: 3,
+					resultRepeaters: [7],
+					...overrides,
+				}),
+				{ channel: 1, protocolDataRate: ProtocolDataRate.ZWave_40k },
+			);
+			return true;
+		},
+	};
+}
+
+test.each([169, 437, 4_990])(
+	"Explorer reception stays on the transmit PHY for a result at +%i ms",
+	async (delay) => {
+		const fixture = await explorerReceiveFixture();
+		try {
+			const sending = fixture.send();
+			await fixture.waitForExplorer();
+			await vi.advanceTimersByTimeAsync(
+				delay - (Date.now() - fixture.sentAt),
+			);
+			expect(fixture.heldChannel).toBe(1);
+			expect(fixture.configure).toHaveBeenCalledTimes(1);
+			expect(fixture.frames().at(-1)?.tx.holdRx).toBe(true);
+			expect(fixture.reply()).toBe(true);
+			const result = await sending;
+			expect(result.status).toBe(ControllerTransmitStatus.OK);
+			expect(result.txReport?.repeaterNodeIds).toEqual([7]);
+			expect(fixture.saved.at(-1)?.routes.get(2)).toEqual([7]);
+			expect(fixture.heldChannel).toBeUndefined();
+			expect(fixture.configure).toHaveBeenCalledTimes(2);
+			expect(fixture.transmit).toHaveBeenCalledTimes(4);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("an unanswered Explorer has one five-second deadline and restores hopping", async () => {
+	const fixture = await explorerReceiveFixture();
+	try {
+		const sending = fixture.send();
+		await fixture.waitForExplorer();
+		await vi.advanceTimersByTimeAsync(
+			4_999 - (Date.now() - fixture.sentAt),
+		);
+		expect(fixture.heldChannel).toBe(1);
+		expect(fixture.configure).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect((await sending).status).toBe(ControllerTransmitStatus.NoRoute);
+		expect(fixture.heldChannel).toBeUndefined();
+		expect(fixture.configure).toHaveBeenCalledTimes(2);
+		expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(true);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("unmatched Explorer results do not shorten the fixed receive window", async () => {
+	const fixture = await explorerReceiveFixture();
+	try {
+		const sending = fixture.send();
+		await fixture.waitForExplorer();
+		for (const overrides of [
+			{ homeId: 0x12345679 },
+			{ sourceNodeId: 7 },
+			{ destinationNodeId: 7 },
+			{ searchingNodeId: 7 },
+			{ frameHandle: 0xff },
+		])
+			fixture.reply(overrides);
+		await vi.advanceTimersByTimeAsync(437);
+		expect(fixture.heldChannel).toBe(1);
+		expect(fixture.configure).toHaveBeenCalledTimes(1);
+		expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(true);
+		fixture.reply();
+		expect((await sending).status).toBe(ControllerTransmitStatus.OK);
+		expect(fixture.configure).toHaveBeenCalledTimes(2);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each(["failure", "throw"] as const)(
+	"Explorer TX %s releases its receive window without a route",
+	async (outcome) => {
+		const fixture = await explorerReceiveFixture();
+		const error = new Error("Explorer transmit failed");
+		fixture.setTerminal(async () => {
+			if (outcome === "throw") throw error;
+			return { status: ControllerTransmitStatus.Fail };
+		});
+		try {
+			expect((await fixture.send()).status).toBe(
+				ControllerTransmitStatus.Fail,
+			);
+			expect(fixture.heldChannel).toBeUndefined();
+			expect(fixture.configure).toHaveBeenCalledTimes(2);
+			expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(
+				true,
+			);
+			if (outcome === "throw") expect(fixture.errors).toContain(error);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("Explorer cleanup retains the send fence and precedes route publication", async () => {
+	const fixture = await explorerReceiveFixture();
+	const cleanup = createDeferredPromise<void>();
+	try {
+		const sending = fixture.send();
+		await fixture.waitForExplorer();
+		fixture.configure.mockImplementationOnce(async () => cleanup);
+		fixture.reply();
+		await vi.waitFor(() =>
+			expect(fixture.configure).toHaveBeenCalledTimes(2),
+		);
+		expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(true);
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.NotIdle,
+		);
+		expect(
+			await fixture.controller.requestNodeInformation(2, 100),
+		).toBeUndefined();
+		expect(await fixture.controller.updateNodeNeighbors(2)).toBe(false);
+		for (const begin of [
+			fixture.controller.networkManagement.beginInclusion,
+			fixture.controller.networkManagement.beginExclusion,
+		]) {
+			await expect(
+				begin(
+					{ nodeType: "any", highPower: false, networkWide: false },
+					() => {},
+				),
+			).rejects.toThrow("transmission is active");
+		}
+		expect(fixture.transmit).toHaveBeenCalledTimes(4);
+		cleanup.resolve();
+		expect((await sending).status).toBe(ControllerTransmitStatus.OK);
+		expect(fixture.saved.at(-1)?.routes.get(2)).toEqual([7]);
+	} finally {
+		cleanup.resolve();
+		await fixture.close();
+	}
+});
+
+test.each(["stop", "reset", "fault"] as const)(
+	"%s cancels pending Explorer reception before its deadline",
+	async (action) => {
+		const fixture = await explorerReceiveFixture();
+		try {
+			const sending = fixture.send();
+			await fixture.waitForExplorer();
+			const before = Date.now();
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("Explorer radio fault"));
+			expect((await sending).status).toBe(ControllerTransmitStatus.Fail);
+			await cancelling;
+			expect(Date.now()).toBe(before);
+			expect(fixture.configure.mock.calls[1][0].autoAck).toBe(false);
+			expect(fixture.heldChannel).toBeUndefined();
+			expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(
+				true,
+			);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["stop", "reset", "fault"] as const)(
+	"%s before the Explorer terminal callback keeps radio ownership until disabled cleanup",
+	async (action) => {
+		const fixture = await explorerReceiveFixture();
+		const terminal = createDeferredPromise<ControllerTransmitResult>();
+		fixture.setTerminal(async () => terminal);
+		fixture.radio.stop = vi.fn(async () => {});
+		try {
+			const sending = fixture.send();
+			await fixture.waitForExplorer();
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("Explorer terminal fault"));
+			await vi.advanceTimersByTimeAsync(0);
+			expect(vi.getTimerCount()).toBe(0);
+			expect(fixture.configure).toHaveBeenCalledTimes(1);
+			expect(fixture.radio.stop).not.toHaveBeenCalled();
+			terminal.resolve({ status: ControllerTransmitStatus.OK });
+			expect((await sending).status).toBe(ControllerTransmitStatus.Fail);
+			await cancelling;
+			expect(fixture.configure.mock.calls[1][0].autoAck).toBe(false);
+			expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(
+				true,
+			);
+		} finally {
+			terminal.resolve({ status: ControllerTransmitStatus.Fail });
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["stop", "reset", "fault"] as const)(
+	"%s during Explorer cleanup prevents late success publication",
+	async (action) => {
+		const fixture = await explorerReceiveFixture();
+		const cleanup = createDeferredPromise<void>();
+		try {
+			const sending = fixture.send();
+			await fixture.waitForExplorer();
+			fixture.configure.mockImplementationOnce(async () => cleanup);
+			fixture.reply();
+			await vi.waitFor(() =>
+				expect(fixture.configure).toHaveBeenCalledTimes(2),
+			);
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("Explorer cleanup fault"));
+			cleanup.resolve();
+			expect((await sending).status).toBe(ControllerTransmitStatus.Fail);
+			expect(fixture.configure.mock.calls[2][0].autoAck).toBe(false);
+			await cancelling;
+			expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(
+				true,
+			);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			cleanup.resolve();
+			await fixture.close();
+		}
+	},
+);
+
+test("failed Explorer receiver cleanup faults the radio without publishing its captured route", async () => {
+	const fixture = await explorerReceiveFixture();
+	const failure = new Error("Explorer cleanup failed");
+	try {
+		const sending = fixture.send();
+		await fixture.waitForExplorer();
+		fixture.configure.mockRejectedValueOnce(failure);
+		const rejected = expect(sending).rejects.toBe(failure);
+		fixture.reply();
+		await rejected;
+		expect(fixture.errors).toContain(failure);
+		expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(true);
+		expect(fixture.configure.mock.calls.at(-1)?.[0].autoAck).toBe(false);
+		expect((await fixture.controller.send(fixture.request)).status).toBe(
+			ControllerTransmitStatus.Fail,
+		);
+		expect(fixture.transmit).toHaveBeenCalledTimes(4);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		await fixture.close();
+	}
+});
+
 test("failed 100 kbit/s recovery followed by an ACKed 40 kbit/s NOP sends DATA exactly once and retains TX preference across slower RX", async () => {
 	const fixture = await rateRecoveryFixture();
 	const probe = createDeferredPromise<{ status: ControllerTransmitStatus }>();

@@ -843,6 +843,9 @@ export class SoftwareController implements RawControllerTransport {
 
 	async #performFactoryDefault(): Promise<ControllerIdentity> {
 		this.#nodeInformationRequest?.cancel();
+		this.#rejectExplorerResultWaiter(
+			new Error("Controller factory-default started"),
+		);
 		await this.#cancelNetworkManagementForFactoryDefault();
 		await this.#activeSend?.catch((error) => this.#reportError(error));
 		if (this.#networkManagementSession || this.#sendInFlight) {
@@ -1324,6 +1327,9 @@ export class SoftwareController implements RawControllerTransport {
 
 	async #stop(): Promise<void> {
 		this.#applicationResponseWindow.cancel();
+		this.#rejectExplorerResultWaiter(
+			new Error("Software controller is stopping"),
+		);
 		this.#nodeReceiveChannels.clear();
 		this.#failedNodeEvidence.clear();
 		this.#nodeActivityGeneration.clear();
@@ -3662,24 +3668,50 @@ export class SoftwareController implements RawControllerTransport {
 		const resultPromise = this.#waitForExplorerResult(
 			request.destinationNodeId,
 			frameHandle,
-		);
-		const wireResult = await this.#transmitMPDU(mpdu, channelNumber);
-		if (wireResult.status !== ControllerTransmitStatus.OK) {
-			this.#rejectExplorerResultWaiter(
-				new Error("Explorer MPDU was not transmitted"),
-			);
-			await resultPromise.catch(() => undefined);
-			return wireResult;
-		}
-
-		let searchResult: SearchResultExplorerZWaveMPDU;
+		).catch(() => undefined);
+		let wireResult: ControllerTransmitResult = {
+			status: ControllerTransmitStatus.Fail,
+		};
+		let searchResult: SearchResultExplorerZWaveMPDU | undefined;
+		let failure: { error: unknown } | undefined;
 		try {
-			searchResult = await resultPromise;
-		} catch {
-			return { status: ControllerTransmitStatus.NoRoute };
+			// Search Results return on the Explorer PHY. Keep RX there atomically
+			// after local TX, rather than leaving fast replies to the hopping phase.
+			wireResult = await this.#transmitMPDU(mpdu, channelNumber, true);
+			if (
+				wireResult.status === ControllerTransmitStatus.OK
+				&& this.#canContinueSend(epoch)
+			)
+				searchResult = await resultPromise;
+		} catch (error) {
+			failure = { error };
 		}
+		this.#rejectExplorerResultWaiter(new Error("Explorer probe completed"));
+		await resultPromise;
+		try {
+			const restoreNetwork = this.#canContinueSend(epoch);
+			if (restoreNetwork) await this.#restoreNormalFiltering();
+			else await this.#configure(this.#radio, "disabled");
+			// A fault or shutdown may supersede an already-submitted restore.
+			if (restoreNetwork && !this.#canContinueSend(epoch)) {
+				await this.#configure(this.#radio, "disabled");
+			}
+		} catch (error) {
+			this.#handleRadioError(error);
+			if (failure) {
+				throw new AggregateError(
+					[...new Set([failure.error, error])],
+					"Explorer probe and receiver cleanup failed",
+				);
+			}
+			throw error;
+		}
+		if (failure) throw failure.error;
 		if (!this.#canContinueSend(epoch))
 			return { status: ControllerTransmitStatus.Fail };
+		if (wireResult.status !== ControllerTransmitStatus.OK)
+			return wireResult;
+		if (!searchResult) return { status: ControllerTransmitStatus.NoRoute };
 		const route = [...searchResult.resultRepeaters];
 		if (
 			route.length > 4
@@ -4116,6 +4148,9 @@ export class SoftwareController implements RawControllerTransport {
 
 	readonly #handleRadioError = (error: unknown): void => {
 		this.#applicationResponseWindow.cancel();
+		this.#rejectExplorerResultWaiter(
+			new Error("Software controller radio failed"),
+		);
 		this.#nodeReceiveChannels.clear();
 		this.#failedNodeEvidence.clear();
 		this.#nodeActivityGeneration.clear();

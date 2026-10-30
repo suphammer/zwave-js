@@ -64,6 +64,33 @@ Explorer provenance; neither captured bytes nor actual broadcast semantics are
 rewritten. This application-delivery normalization does not change transmit
 rates, routes, membership, or firmware behavior.
 
+## Explorer response window
+
+An Explorer NOP retains RX on its transmit PHY atomically when the radio
+finishes local transmission. The existing five-second Search Result deadline
+bounds the host's wait. Normal hopping is restored before the result can
+publish a route, channel preference, or successful transmit report. The same
+operation fence covers transmit, reply wait, and receiver cleanup, so another
+send or management operation cannot retune the receiver during that wait.
+
+Only a Search Result matching the network, target/source, own destination,
+searching node, and frame handle can complete discovery. Local `TX_OK` alone
+is not a remote acknowledgment or route proof. Success, timeout, failed or
+throwing transmission, cancellation, radio fault, reset, and shutdown all
+finish receiver cleanup before releasing ownership. Fault/reset/shutdown
+cleanup disables MAC rather than enabling network traffic. A lifecycle change
+during an already-submitted normal restore also requires a final disable.
+Cleanup failure is an error, not a successful route discovery.
+
+This is a host-managed deadline. The radio contract's `holdRx` state lasts
+until a subsequent transmission/configuration; it is not an autonomous
+firmware timeout or a guarantee after host failure. The Suphacap adapter uses
+its existing atomic HOLD_RX contract and acknowledged MAC configuration for
+restoration. No firmware image or ordinary application-response receive
+policy is changed by this Explorer window. Unit tests model early and late
+same-PHY replies and lifecycle races; physical receive timing still requires
+correlated RF evidence.
+
 ## Application response window
 
 Ordinary acknowledged direct application traffic retains reception on its
