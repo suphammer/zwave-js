@@ -1442,7 +1442,27 @@ export class SoftwareController implements RawControllerTransport {
 				command: Uint8Array.of(0x01, 0x02),
 				transmitOptions: 0,
 			};
-			const result = await this.#sendAcrossClassicChannels(request, true);
+			const sendRequest = async (holdRx: boolean) => {
+				if (!pending.isPending || !this.#canContinueSend(epoch))
+					return { status: ControllerTransmitStatus.Fail };
+				if (this.#requiredBeamMode(pending.nodeId)) {
+					// The atomic beam requires an ACKed frame and cannot retain RX.
+					// Wake with a NOP before sending the unacknowledged NIF request.
+					const wake = await this.#sendAcrossClassicChannels({
+						destinationNodeId: pending.nodeId,
+						command: Uint8Array.of(0),
+						transmitOptions: TRANSMIT_OPTION_ACK,
+					});
+					if (
+						wake.status !== ControllerTransmitStatus.OK
+						|| !pending.isPending
+						|| !this.#canContinueSend(epoch)
+					)
+						return wake;
+				}
+				return this.#sendAcrossClassicChannels(request, holdRx);
+			};
+			const result = await sendRequest(true);
 			if (result.status === ControllerTransmitStatus.OK) {
 				frame = await pending.waitForResponse(
 					NODE_INFORMATION_FIXED_RX_MS,
@@ -1454,8 +1474,7 @@ export class SoftwareController implements RawControllerTransport {
 				) {
 					// A peer may answer on another PHY. Repeating only this idempotent
 					// request resumes hopping without abandoning long same-PHY NIFs.
-					const retry =
-						await this.#sendAcrossClassicChannels(request);
+					const retry = await sendRequest(false);
 					if (retry.status === ControllerTransmitStatus.OK)
 						frame = await pending.response;
 				}
@@ -1708,9 +1727,16 @@ export class SoftwareController implements RawControllerTransport {
 			undefined,
 			applicationResponse,
 		);
+		const isSafeChannelProbe =
+			request.command.length === 1
+			&& request.command[0] === 0x00
+			&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0;
 		if (flirsBeamMode) {
+			if (isSafeChannelProbe && !this.#canContinueSend(epoch))
+				return { status: ControllerTransmitStatus.Fail };
 			if (
 				result.status === ControllerTransmitStatus.OK
+				&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0
 				&& knownChannel !== initialChannel
 			) {
 				void this.#rememberNodeChannel(
@@ -1740,10 +1766,6 @@ export class SoftwareController implements RawControllerTransport {
 			this.#rememberAcknowledgedDirectLink(request, result);
 			return result;
 		}
-		const isSafeChannelProbe =
-			request.command.length === 1
-			&& request.command[0] === 0x00
-			&& (request.transmitOptions & TRANSMIT_OPTION_ACK) !== 0;
 		if (
 			!isSafeChannelProbe
 			|| result.status !== ControllerTransmitStatus.NoAck

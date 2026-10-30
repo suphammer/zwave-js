@@ -1385,6 +1385,367 @@ test("FLiRS stays on its atomic 40 kbit/s path, including the already-awake foll
 	}
 });
 
+async function flirsNodeInformationFixture(mode: "250ms" | "1000ms") {
+	const protocolInfo = Bytes.from([
+		0x53,
+		mode === "250ms" ? 0xbc : 0xdc,
+		1,
+		4,
+		0x10,
+		5,
+	]);
+	const fixture = await rateRecoveryFixture({
+		nodeProtocolInfo: new Map([[2, protocolInfo]]),
+	});
+	fixture.radio.capabilities.beamTx = true;
+	fixture.radio.limits.maximumBeamMPDUSize = 64;
+	const nif = Bytes.concat([[1, 1], protocolInfo, [0x5e, 0x72, 0x86, 0x25]]);
+	return {
+		...fixture,
+		nif,
+		reply: () =>
+			fixture.receiveFrame(
+				new SinglecastZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					ackRequested: false,
+					sequenceNumber: 7,
+					payload: nif,
+				}),
+				{ channel: 1, protocolDataRate: ProtocolDataRate.ZWave_40k },
+			),
+	};
+}
+
+test.each(["250ms", "1000ms"] as const)(
+	"a cold %s FLiRS NIF request wakes with one ACKed NOP before held unacknowledged NI",
+	async (mode) => {
+		const fixture = await flirsNodeInformationFixture(mode);
+		fixture.transmit.mockImplementation(async () => {
+			if (fixture.frames().at(-1)?.frame.payload[0] === 1)
+				fixture.reply();
+			return { status: ControllerTransmitStatus.OK };
+		});
+		try {
+			expect(
+				(await fixture.controller.requestNodeInformation(2, 5_000))
+					?.command,
+			).toEqual(Uint8Array.from(fixture.nif));
+			const frames = fixture.frames();
+			expect(frames.map(({ frame }) => [...frame.payload])).toEqual([
+				[0],
+				[1, 2],
+			]);
+			expect(frames.map(({ frame }) => frame.ackRequested)).toEqual([
+				true,
+				false,
+			]);
+			expect(frames.map(({ tx }) => tx.channel)).toEqual([1, 1]);
+			expect(frames.map(({ tx }) => tx.beamMode)).toEqual([
+				mode,
+				undefined,
+			]);
+			expect(frames.map(({ tx }) => tx.holdRx)).toEqual([false, true]);
+			expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(1);
+			expect(fixture.configure).toHaveBeenCalledTimes(2);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test.each(["250ms", "1000ms"] as const)(
+	"an awake %s FLiRS NIF request does not repeat its beam or NOP",
+	async (mode) => {
+		const fixture = await flirsNodeInformationFixture(mode);
+		fixture.transmit.mockImplementation(async () => {
+			if (fixture.frames().at(-1)?.frame.payload[0] === 1)
+				fixture.reply();
+			return { status: ControllerTransmitStatus.OK };
+		});
+		try {
+			await fixture.controller.send({
+				...fixture.request,
+				command: Bytes.from([0]),
+			});
+			fixture.transmit.mockClear();
+			expect(
+				(await fixture.controller.requestNodeInformation(2, 5_000))
+					?.command,
+			).toEqual(Uint8Array.from(fixture.nif));
+			expect(
+				fixture.frames().map(({ frame }) => [...frame.payload]),
+			).toEqual([[1, 2]]);
+			expect(fixture.frames()[0].tx).toMatchObject({
+				channel: 1,
+				beamMode: undefined,
+				holdRx: true,
+			});
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("a received FLiRS NIF warms the lease without letting unacknowledged NI promote its TX preference", async () => {
+	const fixture = await flirsNodeInformationFixture("1000ms");
+	fixture.transmit.mockImplementation(async () => {
+		if (fixture.frames().at(-1)?.frame.payload[0] === 1) fixture.reply();
+		return { status: ControllerTransmitStatus.OK };
+	});
+	try {
+		fixture.reply();
+		expect(fixture.transmit).not.toHaveBeenCalled();
+		expect(
+			(await fixture.controller.requestNodeInformation(2, 5_000))
+				?.command,
+		).toEqual(Uint8Array.from(fixture.nif));
+		const frames = fixture.frames();
+		expect(frames).toHaveLength(1);
+		expect([...frames[0].frame.payload]).toEqual([1, 2]);
+		expect(frames[0].frame.ackRequested).toBe(false);
+		expect(frames[0].tx).toMatchObject({ channel: 1, beamMode: undefined });
+		expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(2);
+		expect(
+			fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+		).toBe(true);
+
+		expect(
+			(
+				await fixture.controller.send({
+					...fixture.request,
+					command: Bytes.from([0]),
+				})
+			).status,
+		).toBe(ControllerTransmitStatus.OK);
+		expect(fixture.frames().at(-1)?.frame.ackRequested).toBe(true);
+		expect(fixture.saved.at(-1)?.nodeChannels.get(2)).toBe(1);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("a cold FLiRS NIF request fails closed without negotiated beam support", async () => {
+	const fixture = await flirsNodeInformationFixture("1000ms");
+	fixture.radio.capabilities.beamTx = false;
+	try {
+		expect(
+			await fixture.controller.requestNodeInformation(2, 5_000),
+		).toBeUndefined();
+		expect(fixture.transmit).not.toHaveBeenCalled();
+		expect(fixture.configure).toHaveBeenCalledTimes(2);
+		expect(
+			fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+		).toBe(true);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each(["no ACK", "throw"] as const)(
+	"FLiRS wake NOP %s prevents any NIF request",
+	async (outcome) => {
+		const fixture = await flirsNodeInformationFixture("1000ms");
+		const error = new Error("beam failed");
+		fixture.transmit.mockImplementation(async () => {
+			if (outcome === "throw") throw error;
+			return { status: ControllerTransmitStatus.NoAck };
+		});
+		try {
+			expect(
+				await fixture.controller.requestNodeInformation(2, 5_000),
+			).toBeUndefined();
+			expect(
+				fixture.frames().map(({ frame }) => [...frame.payload]),
+			).toEqual([[0]]);
+			expect(
+				fixture.saved.every((state) => state.nodeChannels.get(2) === 2),
+			).toBe(true);
+			if (outcome === "throw") {
+				expect(fixture.errors).toContain(error);
+				expect(fixture.configure.mock.calls.at(-1)?.[0].autoAck).toBe(
+					false,
+				);
+			}
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("a NIF captured during a successful FLiRS wake waits for terminal ACK and cleanup", async () => {
+	const fixture = await flirsNodeInformationFixture("1000ms");
+	const wake = createDeferredPromise<ControllerTransmitResult>();
+	const cleanup = createDeferredPromise<void>();
+	fixture.transmit.mockImplementation(async () => wake);
+	try {
+		const receiving = fixture.controller.requestNodeInformation(2, 5_000);
+		let published = false;
+		void receiving.then(() => {
+			published = true;
+		});
+		fixture.reply();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(published).toBe(false);
+		expect(fixture.configure).toHaveBeenCalledTimes(1);
+		fixture.configure.mockImplementationOnce(async () => cleanup);
+		wake.resolve({ status: ControllerTransmitStatus.OK });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(fixture.configure).toHaveBeenCalledTimes(2);
+		expect(published).toBe(false);
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+		cleanup.resolve();
+		expect((await receiving)?.command).toEqual(
+			Uint8Array.from(fixture.nif),
+		);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		wake.resolve({ status: ControllerTransmitStatus.Fail });
+		cleanup.resolve();
+		await fixture.close();
+	}
+});
+
+test("a NIF captured during an unacknowledged FLiRS wake cannot publish success", async () => {
+	const fixture = await flirsNodeInformationFixture("1000ms");
+	fixture.transmit.mockImplementation(async () => {
+		fixture.reply();
+		return { status: ControllerTransmitStatus.NoAck };
+	});
+	try {
+		expect(
+			await fixture.controller.requestNodeInformation(2, 5_000),
+		).toBeUndefined();
+		expect(fixture.transmit).toHaveBeenCalledTimes(1);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each(["deadline", "abort", "stop", "reset", "fault"] as const)(
+	"%s during a FLiRS wake prevents a later NIF transmission",
+	async (action) => {
+		const fixture = await flirsNodeInformationFixture("1000ms");
+		const wake = createDeferredPromise<ControllerTransmitResult>();
+		const abort = new AbortController();
+		fixture.transmit.mockImplementation(async () => wake);
+		try {
+			const receiving = fixture.controller.requestNodeInformation(
+				2,
+				500,
+				abort.signal,
+			);
+			expect(fixture.transmit).toHaveBeenCalledTimes(1);
+			let cancelling: Promise<unknown> = Promise.resolve();
+			if (action === "deadline") await vi.advanceTimersByTimeAsync(500);
+			else if (action === "abort") abort.abort();
+			else if (action === "stop") cancelling = fixture.controller.stop();
+			else if (action === "reset")
+				cancelling = fixture.controller.factoryDefault!();
+			else fixture.radioError(new Error("beam interrupted"));
+			wake.resolve({ status: ControllerTransmitStatus.OK });
+			expect(await receiving).toBeUndefined();
+			await cancelling;
+			expect(
+				fixture.frames().map(({ frame }) => [...frame.payload]),
+			).toEqual([[0]]);
+			if (action === "stop" || action === "reset" || action === "fault") {
+				expect(fixture.configure.mock.calls[1][0].autoAck).toBe(false);
+				expect(
+					fixture.saved.every(
+						(state) =>
+							!state.nodeChannels.has(2)
+							|| state.nodeChannels.get(2) === 2,
+					),
+				).toBe(true);
+			}
+			expect(fixture.saved.every((state) => !state.routes.has(2))).toBe(
+				true,
+			);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			wake.resolve({ status: ControllerTransmitStatus.Fail });
+			await fixture.close();
+		}
+	},
+);
+
+test("FLiRS wake and both NIF phases share the original absolute response deadline", async () => {
+	const fixture = await flirsNodeInformationFixture("1000ms");
+	const wake = createDeferredPromise<ControllerTransmitResult>();
+	fixture.transmit.mockImplementation(async () =>
+		fixture.frames().at(-1)?.frame.payload[0] === 0
+			? wake
+			: { status: ControllerTransmitStatus.OK },
+	);
+	try {
+		const receiving = fixture.controller.requestNodeInformation(2, 1_500);
+		await vi.advanceTimersByTimeAsync(1_000);
+		wake.resolve({ status: ControllerTransmitStatus.OK });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(250);
+		expect(fixture.transmit).toHaveBeenCalledTimes(3);
+		await vi.advanceTimersByTimeAsync(250);
+		expect(await receiving).toBeUndefined();
+		expect(fixture.frames().map(({ frame }) => [...frame.payload])).toEqual(
+			[[0], [1, 2], [1, 2]],
+		);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		wake.resolve({ status: ControllerTransmitStatus.Fail });
+		await fixture.close();
+	}
+});
+
+test("the hopping NIF phase rechecks an expired FLiRS awake lease", async () => {
+	const fixture = await flirsNodeInformationFixture("1000ms");
+	const heldRequest = createDeferredPromise<ControllerTransmitResult>();
+	fixture.transmit.mockImplementation(async () => {
+		if (fixture.transmit.mock.calls.length === 2) return heldRequest;
+		if (fixture.transmit.mock.calls.length === 4) fixture.reply();
+		return { status: ControllerTransmitStatus.OK };
+	});
+	try {
+		const receiving = fixture.controller.requestNodeInformation(2, 5_000);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(fixture.transmit).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(1_600);
+		heldRequest.resolve({ status: ControllerTransmitStatus.OK });
+		await vi.advanceTimersByTimeAsync(250);
+		expect((await receiving)?.command).toEqual(
+			Uint8Array.from(fixture.nif),
+		);
+		const frames = fixture.frames();
+		expect(frames.map(({ frame }) => [...frame.payload])).toEqual([
+			[0],
+			[1, 2],
+			[0],
+			[1, 2],
+		]);
+		expect(frames.map(({ tx }) => tx.beamMode)).toEqual([
+			"1000ms",
+			undefined,
+			"1000ms",
+			undefined,
+		]);
+		expect(frames.map(({ tx }) => tx.holdRx)).toEqual([
+			false,
+			true,
+			false,
+			false,
+		]);
+		expect(frames.every(({ tx }) => tx.channel === 1)).toBe(true);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		heldRequest.resolve({ status: ControllerTransmitStatus.Fail });
+		await fixture.close();
+	}
+});
+
 test("a node-information request keeps its held receive path without a proactive NOP", async () => {
 	const fixture = await rateRecoveryFixture();
 	fixture.transmit.mockImplementation(async () => {

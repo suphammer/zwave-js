@@ -24,9 +24,9 @@ emulate these across USB through host timers. The software controller owns
 the longer inclusion and replication sequences, using the radio's completed
 MAC transactions.
 
-Request Node Information waits up to five seconds on the selected transmit
-channel. The radio holds RX there as part of the
-transmit operation, so an immediate 9.6 kbit/s NIF cannot be lost to a retune.
+Request Node Information uses a bounded response wait with an initial held
+receive phase followed, if needed, by normal hopping. Known FLiRS peers use
+the wake preflight described below.
 The software controller restores normal reception before returning the
 observed NIF to the Driver. Timeout, cancellation, reset, shutdown, and radio
 errors trigger the same receiver cleanup; shutdown and fault cleanup disable MAC
@@ -203,12 +203,23 @@ request remains active, the controller repeats only the idempotent Protocol CC
 This lets a peer answer on another Classic PHY, including an awake battery
 device whose NIF uses a different rate from its verified inclusion ACK.
 
-Both phases share one response waiter, transmit fence, and original deadline of
-at most five seconds. Cancellation, shutdown, reset, or radio fault prevents a
-follow-up request, and receiver cleanup completes before the NIF reaches the
-Driver. The operation sends at most two requests, adds no NOP or higher-rate TX
-probe, and does not change the ACK-confirmed preferred transmit channel from
-passive NIF reception or unacknowledged local transmit completion.
+For a known FLiRS destination whose awake lease is absent or expired, each
+phase first wakes it with an ACK-requested NOP using the existing atomic beam
+path. The NOP's ACK establishes the short awake lease; the subsequent `01 02`
+request remains unacknowledged and can retain RX without combining beam and
+hold-RX flags. An active lease avoids the extra NOP. A matching NIF received
+during a successful wake can complete the request after receiver cleanup,
+without another transmission.
+
+Both phases and any FLiRS wake share one response waiter, transmit fence, and
+original deadline of at most five seconds. Cancellation, shutdown, reset,
+radio fault, or expiry during the wake prevents a follow-up request, and
+receiver cleanup completes before the NIF reaches the Driver. The operation
+sends at most two `01 02` requests; a failed wake prevents its following request,
+and an expired lease before the second phase requires another ACKed wake NOP. Non-FLiRS
+requests add no NOP, and no request performs higher-rate TX probes. Passive NIF
+reception or unacknowledged local transmit completion does not establish an
+ACK-confirmed preferred transmit channel.
 
 At the Serial API boundary, `ApplicationUpdate(NodeInfo_RequestFailed)` (`0x81`)
 is a terminal unsuccessful callback for `RequestNodeInfo`. It rejects the
