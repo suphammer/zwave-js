@@ -1166,6 +1166,283 @@ test("a 350 ms Meter Report survives retained RX, and a new TX supersedes its on
 	}
 });
 
+test.each(["NIF", "application"])(
+	"a validated cross-PHY %s keeps application RX hopping after the terminal ACK",
+	async (observation) => {
+		const saved: SoftwareControllerState[] = [];
+		const fixture = await responseRestoreFixture({
+			channel: 2,
+			nodeChannels: new Map([[2, 2]]),
+			nodeProtocolInfo: new Map([[2, Bytes.from("539c01040701", "hex")]]),
+			onControllerStateChanged: (state) => {
+				saved.push(state);
+			},
+		});
+		const received: ControllerApplicationFrame[] = [];
+		const terminal = createDeferredPromise<{
+			status: ControllerTransmitStatus;
+		}>();
+		let hopping = false;
+		fixture.onFrame((frame) => received.push(frame));
+		const receive = (command: Bytes, channel: number) => {
+			fixture.receiveFrame(
+				new SinglecastZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					ackRequested: true,
+					sequenceNumber: 1,
+					speedModified: false,
+					payload: command,
+				}),
+				{
+					channel,
+					protocolDataRate: fixture.channels[channel].dataRate,
+				},
+			);
+		};
+		fixture.transmit.mockImplementation(async (request) => {
+			await terminal;
+			hopping = !request.holdRx;
+			return { status: ControllerTransmitStatus.OK };
+		});
+		try {
+			receive(
+				Bytes.from(
+					observation === "NIF"
+						? "0101539c0107015e86725a738031713070855984"
+						: "86148602",
+					"hex",
+				),
+				1,
+			);
+			received.length = 0;
+			const sending = fixture.controller.send(fixture.request);
+			await Promise.resolve();
+			expect(fixture.transmit).toHaveBeenCalledOnce();
+			const tx = fixture.transmit.mock.calls[0][0];
+			expect(tx.channel).toBe(2);
+			expect(tx.holdRx).toBe(false);
+			expect(tx.alternateRx).toBe(false);
+			expect(hopping).toBe(false);
+			fixture.receiveFrame(
+				new AckZWaveMPDU({
+					homeId: 0x12345678,
+					sourceNodeId: 2,
+					destinationNodeId: 1,
+					sequenceNumber: 1,
+					speedModified: false,
+				}),
+				{ channel: 2, protocolDataRate: ProtocolDataRate.ZWave_9k6 },
+			);
+			terminal.resolve({ status: ControllerTransmitStatus.OK });
+			expect((await sending).status).toBe(ControllerTransmitStatus.OK);
+			await vi.advanceTimersByTimeAsync(7);
+			if (hopping) receive(Bytes.from("310503220014", "hex"), 0);
+			await vi.advanceTimersByTimeAsync(49);
+			if (hopping) receive(Bytes.from("310503220014", "hex"), 1);
+			expect(received).toHaveLength(2);
+			expect(fixture.transmit).toHaveBeenCalledOnce();
+			expect(
+				(await fixture.controller.send(fixture.request)).status,
+			).toBe(ControllerTransmitStatus.OK);
+			expect(fixture.transmit.mock.calls[1][0].channel).toBe(2);
+			expect(fixture.transmit.mock.calls[1][0].holdRx).toBe(false);
+			expect(fixture.configure).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(fixture.configure).toHaveBeenCalledTimes(1);
+			expect(saved.length).toBeGreaterThan(0);
+			expect(
+				saved.every((state) => state.nodeChannels.get(2) === 2),
+			).toBe(true);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("a same-TX-PHY ACK cannot overwrite a different observed application RX channel", async () => {
+	const fixture = await responseRestoreFixture({
+		channel: 2,
+		nodeChannels: new Map([[2, 2]]),
+		nodeProtocolInfo: new Map([[2, Bytes.from("539c01040701", "hex")]]),
+	});
+	try {
+		fixture.receiveCommand(Bytes.from("86148602", "hex"));
+		fixture.receiveFrame(
+			new AckZWaveMPDU({
+				homeId: 0x12345678,
+				sourceNodeId: 2,
+				destinationNodeId: 1,
+				sequenceNumber: 1,
+				speedModified: false,
+			}),
+			{ channel: 2, protocolDataRate: ProtocolDataRate.ZWave_9k6 },
+		);
+		await fixture.controller.send(fixture.request);
+		expect(fixture.transmit.mock.calls[0][0].channel).toBe(2);
+		expect(fixture.transmit.mock.calls[0][0].holdRx).toBe(false);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each([
+	"foreign Home ID",
+	"nonmember",
+	"own node",
+	"broadcast application",
+	"another destination",
+	"truncated NIF",
+	"truncated application",
+	"other Protocol CC",
+	"invalid channel",
+	"inconsistent rate",
+	"routed",
+	"Explorer",
+])("%s cannot replace application RX placement", async (observation) => {
+	const fixture = await responseRestoreFixture({
+		channel: 2,
+		nodeChannels: new Map([[2, 2]]),
+		nodeProtocolInfo: new Map([[2, Bytes.from("539c01040701", "hex")]]),
+	});
+	try {
+		const options = {
+			homeId: observation === "foreign Home ID" ? 0x87654321 : 0x12345678,
+			sourceNodeId:
+				observation === "nonmember"
+					? 3
+					: observation === "own node"
+						? 1
+						: 2,
+			destinationNodeId:
+				observation === "broadcast application"
+					? 255
+					: observation === "another destination"
+						? 4
+						: 1,
+			ackRequested: true,
+			sequenceNumber: 1,
+			speedModified: false,
+			payload: Bytes.from(
+				observation === "truncated NIF"
+					? "0101"
+					: observation === "truncated application"
+						? "86"
+						: observation === "other Protocol CC"
+							? "0102"
+							: "86148602",
+				"hex",
+			),
+		};
+		const frame =
+			observation === "routed"
+				? new RoutedZWaveMPDU({
+						...options,
+						headerType: MPDUHeaderType.Singlecast,
+						routed: true,
+						direction: "inbound",
+						routedAck: false,
+						routedError: false,
+						hop: 0,
+						repeaters: [3],
+					})
+				: observation === "Explorer"
+					? new NormalExplorerZWaveMPDU({
+							...options,
+							headerType: MPDUHeaderType.Explorer,
+							routed: false,
+							version: 1,
+							command: ExplorerFrameCommand.Normal,
+							stop: false,
+							sourceRouted: false,
+							direction: "inbound",
+							randomTXInterval: 0,
+							ttl: 4,
+							repeaters: [],
+						})
+					: new SinglecastZWaveMPDU(options);
+		fixture.receiveFrame(frame, {
+			channel: observation === "invalid channel" ? 99 : 1,
+			protocolDataRate:
+				observation === "inconsistent rate"
+					? ProtocolDataRate.ZWave_100k
+					: ProtocolDataRate.ZWave_40k,
+		});
+		await fixture.controller.send(fixture.request);
+		expect(fixture.transmit.mock.calls[0][0].channel).toBe(2);
+		expect(fixture.transmit.mock.calls[0][0].holdRx).toBe(true);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("a radio restart clears receive placement observations without changing transmit preference", async () => {
+	const fixture = await responseRestoreFixture({
+		channel: 2,
+		nodeChannels: new Map([[2, 2]]),
+		nodeProtocolInfo: new Map([[2, Bytes.from("539c01040701", "hex")]]),
+	});
+	try {
+		fixture.receiveCommand(Bytes.from("86148602", "hex"));
+		await fixture.controller.send(fixture.request);
+		expect(fixture.transmit.mock.calls[0][0].holdRx).toBe(false);
+		await fixture.controller.stop();
+		await fixture.controller.start(() => {});
+		await fixture.controller.send(fixture.request);
+		expect(fixture.transmit.mock.calls[1][0].channel).toBe(2);
+		expect(fixture.transmit.mock.calls[1][0].holdRx).toBe(true);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test.each(["unknown", "same PHY"])(
+	"a 322 ms same-PHY report retains the full response lease with %s RX placement",
+	async (observation) => {
+		const fixture = await responseRestoreFixture({
+			channel: 2,
+			nodeChannels: new Map([[2, 2]]),
+			nodeProtocolInfo: new Map([[2, Bytes.from("539c01040701", "hex")]]),
+		});
+		const received: ControllerApplicationFrame[] = [];
+		fixture.onFrame((frame) => received.push(frame));
+		const report = new SinglecastZWaveMPDU({
+			homeId: 0x12345678,
+			sourceNodeId: 2,
+			destinationNodeId: 1,
+			ackRequested: true,
+			sequenceNumber: 1,
+			speedModified: true,
+			payload: Bytes.from("32022111000000", "hex"),
+		});
+		try {
+			if (observation === "same PHY") {
+				fixture.receiveFrame(report, {
+					channel: 2,
+					protocolDataRate: ProtocolDataRate.ZWave_9k6,
+				});
+				received.length = 0;
+			}
+			await fixture.controller.send(fixture.request);
+			expect(fixture.transmit.mock.calls[0][0].holdRx).toBe(true);
+			await vi.advanceTimersByTimeAsync(322);
+			fixture.receiveFrame(report, {
+				channel: 2,
+				protocolDataRate: ProtocolDataRate.ZWave_9k6,
+			});
+			expect(received).toHaveLength(1);
+			expect(fixture.configure).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(677);
+			expect(fixture.configure).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(fixture.configure).toHaveBeenCalledTimes(2);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
 test("a delayed application response waits for internal RX restoration before its next send", async () => {
 	const fixture = await responseRestoreFixture();
 	try {

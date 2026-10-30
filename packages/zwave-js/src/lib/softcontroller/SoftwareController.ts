@@ -513,6 +513,7 @@ export class SoftwareController implements RawControllerTransport {
 	readonly #includedNodeIds: Set<number>;
 	readonly #quarantinedNodeIds = new Set<number>();
 	readonly #nodeChannels = new Map<number, number>();
+	readonly #nodeReceiveChannels = new Map<number, number>();
 	readonly #dataRateRecoveryAfter = new Map<number, number>();
 	readonly #nodeNeighbors = new Map<number, readonly number[]>();
 	readonly #nodeProtocolInfo = new Map<number, Bytes>();
@@ -667,6 +668,7 @@ export class SoftwareController implements RawControllerTransport {
 			this.#includedNodeIds.add(1);
 			this.#quarantinedNodeIds.clear();
 			this.#nodeChannels.clear();
+			this.#nodeReceiveChannels.clear();
 			this.#dataRateRecoveryAfter.clear();
 			this.#nodeNeighbors.clear();
 			this.#nodeProtocolInfo.clear();
@@ -1006,6 +1008,7 @@ export class SoftwareController implements RawControllerTransport {
 			throw new Error("Software controller is already started");
 		this.#stopOperation = undefined;
 		this.#started = true;
+		this.#nodeReceiveChannels.clear();
 		this.#directNeighborNodeIds.clear();
 		this.#onFrame = onFrame;
 		try {
@@ -1097,6 +1100,7 @@ export class SoftwareController implements RawControllerTransport {
 
 	async #stop(): Promise<void> {
 		this.#applicationResponseWindow.cancel();
+		this.#nodeReceiveChannels.clear();
 		if (!this.#started) {
 			await this.#persistenceTail;
 			const errors = [...this.#startupCleanupErrors];
@@ -1815,10 +1819,17 @@ export class SoftwareController implements RawControllerTransport {
 			);
 			return { status: ControllerTransmitStatus.Fail };
 		}
+		const observedReceiveChannel = this.#nodeReceiveChannels.get(
+			request.destinationNodeId,
+		);
 		const holdApplicationResponse =
 			applicationResponse
 			&& !holdRx
 			&& !alternateRx
+			// A verified receive PHY can differ from the ACK-confirmed transmit PHY.
+			// Resume normal RX atomically after the MAC ACK instead of trapping replies.
+			&& (observedReceiveChannel === undefined
+				|| observedReceiveChannel === channel)
 			&& shouldHoldApplicationResponse(
 				request.command,
 				directRoute,
@@ -3102,6 +3113,7 @@ export class SoftwareController implements RawControllerTransport {
 				this.#includedNodeIds.delete(nodeId);
 				this.#quarantinedNodeIds.delete(nodeId);
 				this.#nodeChannels.delete(nodeId);
+				this.#nodeReceiveChannels.delete(nodeId);
 				this.#dataRateRecoveryAfter.delete(nodeId);
 				this.#nodeProtocolInfo.delete(nodeId);
 				this.#flirsAwakeUntil.delete(nodeId);
@@ -3711,6 +3723,7 @@ export class SoftwareController implements RawControllerTransport {
 				const nodeInformation = parseOverAirNodeInformationFrame(
 					mpdu.payload.subarray(2),
 				);
+				this.#rememberNodeReceiveChannel(mpdu, info);
 				this.#nodeProtocolInfo.set(
 					mpdu.sourceNodeId,
 					protocolInfoFromNIF(
@@ -3749,12 +3762,45 @@ export class SoftwareController implements RawControllerTransport {
 			frameType,
 			isExploreFrame: mpdu instanceof ExplorerZWaveMPDU,
 		};
+		if (
+			!isNodeInformationFrame
+			&& mpdu.payload.length >= 2
+			&& mpdu.payload[0] !== 0x00
+			&& mpdu.payload[0] !== PROTOCOL_CC
+			&& destination === this.#normalized.ownNodeId
+		) {
+			this.#rememberNodeReceiveChannel(mpdu, info);
+		}
 		if (this.#nodeInformationRequest?.accept(frame)) return;
 		this.#onFrame(frame);
 	};
 
+	#rememberNodeReceiveChannel(mpdu: MPDU, info: MPDURxInfo): void {
+		if (
+			!this.#started
+			|| this.#faulted
+			|| this.#stopOperation
+			|| this.#factoryDefaultOperation
+			|| this.#networkManagementSession
+			|| !(mpdu instanceof SinglecastZWaveMPDU)
+			|| mpdu.headerType !== MPDUHeaderType.Singlecast
+			|| mpdu.routed
+			|| mpdu.homeId !== this.#normalized.homeId
+			|| mpdu.sourceNodeId === this.#normalized.ownNodeId
+			|| !this.#includedNodeIds.has(mpdu.sourceNodeId)
+			|| !this.#regionConfig?.channels.some(
+				(channel) =>
+					channel.channel === info.channel
+					&& channel.dataRate === info.protocolDataRate,
+			)
+		)
+			return;
+		this.#nodeReceiveChannels.set(mpdu.sourceNodeId, info.channel);
+	}
+
 	readonly #handleRadioError = (error: unknown): void => {
 		this.#applicationResponseWindow.cancel();
+		this.#nodeReceiveChannels.clear();
 		this.#nodeInformationRequest?.cancel();
 		if (this.#networkManagementSession) {
 			this.#stopTransferPresentation(this.#networkManagementSession);

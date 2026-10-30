@@ -64,6 +64,25 @@ Fibaro Meter Report about 322 ms after its ACK, beyond the former 250 ms receive
 window. The one-second bound covers that measured delay; device response timing
 still requires matching RF evidence after deployment.
 
+The controller separately remembers the receive channel of a valid direct NIF
+or a direct application transport frame with at least its Command Class and
+command bytes, from an included node on its own Home ID. Application Command
+Class parsing remains the Driver's responsibility. When that
+observed channel differs from the next direct application's transmit channel,
+the operation omits the fixed receive lease. The radio completes its local
+transmit/ACK transaction and restores normal hopping before reporting MAC
+completion. This avoids missing replies on another PHY without retransmitting
+the application command or adding probes to sleeping nodes. Same-channel and
+unknown receive placement retain the full one-second lease, including delayed
+same-PHY replies. Hopping provides receive opportunities across the supported
+PHYs; it does not guarantee reception of every individual packet.
+
+These receive observations are volatile and never promote the ACK-confirmed
+transmit preference. ACKs, foreign/nonmember/own-node traffic, routed and
+Explorer frames, malformed NIFs, truncated commands, and invalid channel/rate
+combinations cannot establish them. They are cleared on radio restart, fault,
+factory default, or removal of the corresponding node.
+
 Failed held transmissions restore reception before releasing the fence.
 Management, reset, stop, and radio faults cancel stale deadlines; stop waits for
 an already-running restoration, and fault/reset/shutdown cleanup disables MAC.
