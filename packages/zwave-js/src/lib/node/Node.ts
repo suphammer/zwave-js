@@ -93,6 +93,7 @@ import { embeddedDevicesDir } from "@zwave-js/config";
 import {
 	BasicDeviceClass,
 	CommandClasses,
+	ControllerStatus,
 	Duration,
 	type DurationLike,
 	EncapsulationFlags,
@@ -179,6 +180,7 @@ import {
 import { roundTo } from "alcalzone-shared/math";
 import path from "pathe";
 
+import { InclusionState } from "../controller/Inclusion.js";
 import type { Driver } from "../driver/Driver.js";
 import { cacheKeys } from "../driver/NetworkCache.js";
 import type { StatisticsEventCallbacksWithSelf } from "../driver/Statistics.js";
@@ -1239,7 +1241,7 @@ export class ZWaveNode extends ZWaveNodeMixins implements QuerySecurityClasses {
 				&& this.status !== NodeStatus.Alive
 			) {
 				// Ping non-sleeping nodes to determine their status
-				if (!(await this.ping())) {
+				if (!(await this.determineStatus())) {
 					// Not alive, abort the interview
 					return false;
 				}
@@ -1372,6 +1374,51 @@ protocol version:      ${this.protocolVersion}`;
 
 		this.setInterviewStage(InterviewStage.ProtocolInfo);
 	}
+
+	/**
+	 * @internal
+	 * Determines reachability during startup and interviews without retrying application commands.
+	 */
+	public determineStatus(): Promise<boolean> {
+		if (this._statusProbe) return this._statusProbe;
+		const operation: Promise<boolean> = Promise.resolve()
+			.then(async () => {
+				if (!this.driver.ready) return false;
+				const controller = this.driver.controller;
+				const homeId = controller.homeId;
+				const isCurrentNode = () =>
+					this.driver.ready
+					&& this.driver.controller === controller
+					&& controller.status === ControllerStatus.Ready
+					&& controller.homeId === homeId
+					&& controller.nodes.get(this.id) === this;
+				if (!isCurrentNode()) return false;
+				const reachable = await this.ping();
+				if (!isCurrentNode()) return false;
+				if (reachable) return true;
+				if (
+					this.protocol !== Protocols.ZWave
+					|| this.isListening !== true
+					|| this.isFrequentListening !== false
+					|| this.canSleep !== false
+					|| controller.inclusionState !== InclusionState.Idle
+				)
+					return false;
+
+				// A cached path can become stale after a node moves. Only a NOP may
+				// request one bounded route-resolution attempt before this status check ends.
+				const recovered = await this.ping(true);
+				return recovered && isCurrentNode();
+			})
+			.finally(() => {
+				if (this._statusProbe === operation)
+					this._statusProbe = undefined;
+			});
+		this._statusProbe = operation;
+		return operation;
+	}
+
+	private _statusProbe: Promise<boolean> | undefined;
 
 	/**
 	 * Pings the node to see if it responds

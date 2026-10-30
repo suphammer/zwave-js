@@ -2600,7 +2600,7 @@ export class Driver
 							|| node.isFrequentListening
 						) {
 							// Ping non-sleeping nodes to determine their status
-							void node.ping();
+							void node.determineStatus();
 						}
 					}
 				}
@@ -2650,7 +2650,7 @@ export class Driver
 							.join(", ")}`,
 					);
 					for (const node of nodeInterviewOrder) {
-						void node.ping();
+						void node.determineStatus();
 					}
 				}
 			}
