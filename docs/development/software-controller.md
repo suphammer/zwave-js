@@ -40,6 +40,30 @@ transmit cancellation remain disabled for the initial software controller.
 Missing node protocol information and unobserved links must not become
 invented device capabilities or routes.
 
+## Application delivery and Explorer provenance
+
+The backend's application `frameType` describes the logical destination. An
+Explorer DATA frame addressed to this controller is singlecast application
+delivery, even though its RF header uses the Explorer format. Marking that
+callback as broadcast makes the Driver parse its Command Class as a broadcast
+command, without the normal node endpoint and ValueDB persistence. Reports
+used by device interviews therefore need their actual delivery type preserved.
+
+The compatibility binding emits these addressed Explorer reports as ordinary
+singlecast `ApplicationCommand` callbacks: the type bits are singlecast and
+the Explore bit is omitted. Actual broadcast Explorer delivery retains both
+TypeBroad and Explore (`0x14` without other flags); ordinary broadcast and
+multicast retain their existing type flags. This follows the documented
+[Silicon Labs 7.24 receive-status restriction](https://docs.silabs.com/z-wave/7.24.0/zwave-api/receive-status)
+on combining Explore with broadcast. The shared Serial API parser is unchanged.
+
+This boundary deliberately loses the `isExploreFrame` annotation for the
+singlecast Serial API consumer. The backend's native receive metadata and the
+original MPDU, RCP receive record, and independent Zniffer capture retain their
+Explorer provenance; neither captured bytes nor actual broadcast semantics are
+rewritten. This application-delivery normalization does not change transmit
+rates, routes, membership, or firmware behavior.
+
 ## Application response window
 
 Ordinary acknowledged direct application traffic retains reception on its

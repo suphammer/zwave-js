@@ -8,9 +8,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+	ChannelConfiguration,
 	CommandClasses,
 	InterviewStage,
+	MPDU,
 	NodeStatus,
+	NormalExplorerZWaveMPDU,
+	ProtocolDataRate,
+	RFRegion,
 	parseBitMask,
 	parseNodeUpdatePayload,
 } from "@zwave-js/core";
@@ -40,6 +45,11 @@ import {
 	encodeSerialApiFrame,
 	type SerialApiFrame,
 } from "./SerialAPI.js";
+import { SoftwareController } from "./SoftwareController.js";
+import type {
+	SoftwareControllerMPDURxInfo,
+	SoftwareControllerRadio,
+} from "./SoftwareControllerRadio.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -798,6 +808,175 @@ test("ordinary application commands retain their application callback", async ()
 		);
 	} finally {
 		await fixture.close();
+	}
+});
+
+test.each([
+	{ frameType: "singlecast", isExploreFrame: true, status: 0x00 },
+	{ frameType: "broadcast", isExploreFrame: true, status: 0x14 },
+	{ frameType: "broadcast", isExploreFrame: false, status: 0x04 },
+	{ frameType: "multicast", isExploreFrame: true, status: 0x08 },
+] as const)(
+	"Explorer transport preserves $frameType Serial API addressing",
+	async ({ frameType, isExploreFrame, status }) => {
+		const fixture = await bindingFixture();
+		try {
+			await fixture.receive({
+				sourceNodeId: 2,
+				command: Bytes.from("7205010f06021001", "hex"),
+				frameType,
+				isExploreFrame,
+			});
+			expect(fixture.frames).toEqual([
+				{
+					type: SerialApiMessageType.Request,
+					functionType: SerialApiFunction.ApplicationCommand,
+					payload: Uint8Array.from([
+						status,
+						2,
+						8,
+						0x72,
+						5,
+						1,
+						0x0f,
+						6,
+						2,
+						0x10,
+						1,
+					]),
+				},
+			]);
+		} finally {
+			await fixture.close();
+		}
+	},
+);
+
+test("a captured singlecast Explorer report reaches the real Driver value DB", async () => {
+	vi.useRealTimers();
+	const directory = await mkdtemp(join(tmpdir(), "zwave-explorer-report-"));
+	let receive!: (mpdu: MPDU, info: SoftwareControllerMPDURxInfo) => void;
+	const radio: SoftwareControllerRadio = {
+		capabilities: {
+			localAck: true,
+			localTransmitAck: true,
+			explorerTargetReply: true,
+			routedAckStatus: true,
+			explorerTx: false,
+			beamTx: false,
+		},
+		limits: { maximumMPDUSize: 64, maximumBeamMPDUSize: 0 },
+		start: async (onMPDU) => {
+			receive = onMPDU;
+			return {
+				region: RFRegion.Europe,
+				channelConfig: ChannelConfiguration.Classic,
+				channels: [
+					{
+						channel: 0,
+						frequency: 869850000,
+						dataRate: ProtocolDataRate.ZWave_100k,
+					},
+					{
+						channel: 1,
+						frequency: 868400000,
+						dataRate: ProtocolDataRate.ZWave_40k,
+					},
+					{
+						channel: 2,
+						frequency: 868400000,
+						dataRate: ProtocolDataRate.ZWave_9k6,
+					},
+				],
+			};
+		},
+		configure: vi.fn(async () => {}),
+		transmit: vi.fn(async () => ({
+			status: ControllerTransmitStatus.NoAck,
+		})),
+		stop: vi.fn(async () => {}),
+	};
+	const transport = new SoftwareController({
+		radioFactory: () => radio,
+		region: RFRegion.Europe,
+		homeId: 0x08410a67,
+		ownNodeId: 1,
+		includedNodeIds: [1, 7, 12],
+	});
+	const driver = new Driver(
+		createControllerBinding({
+			transport,
+			homeId: 0x08410a67,
+			ownNodeId: 1,
+			includedNodeIds: [1, 7, 12],
+		}),
+		{
+			storage: { cacheDir: directory },
+			logConfig: { enabled: false },
+			testingHooks: {
+				skipFirmwareIdentification: true,
+				skipNodeInterview: true,
+				loadConfiguration: false,
+			},
+		},
+	);
+	const errors: unknown[] = [];
+	driver.on("error", (error) => errors.push(error));
+	try {
+		const ready = new Promise<void>((resolve) =>
+			driver.once("driver ready", resolve),
+		);
+		await driver.start();
+		await ready;
+		const node = driver.controller.nodes.getOrThrow(12);
+		const captured = Bytes.from(
+			"08410a670c45041a012000fa31070000007205010f06021001",
+			"hex",
+		);
+		const info = {
+			channel: 1,
+			protocolDataRate: ProtocolDataRate.ZWave_40k,
+		};
+		const decode = () => {
+			const mpdu = MPDU.parse(captured, {
+				region: RFRegion.Europe,
+				...info,
+			});
+			expect(mpdu).toBeInstanceOf(NormalExplorerZWaveMPDU);
+			return mpdu as NormalExplorerZWaveMPDU;
+		};
+		const broadcast = decode();
+		broadcast.destinationNodeId = 0xff;
+		receive(broadcast, info);
+		await vi.waitFor(() => expect(node.statistics.commandsRX).toBe(1));
+		expect(node.manufacturerId).toBeUndefined();
+		expect(
+			node.valueDB.getValues(CommandClasses["Manufacturer Specific"]),
+		).toEqual([]);
+
+		const singlecast = decode();
+		expect(singlecast.destinationNodeId).toBe(1);
+		expect(singlecast.repeaters).toEqual([7]);
+		expect(singlecast.payload.toString("hex")).toBe("7205010f06021001");
+		receive(singlecast, info);
+		await vi.waitFor(() => expect(node.manufacturerId).toBe(0x010f));
+		expect(node.productType).toBe(0x0602);
+		expect(node.productId).toBe(0x1001);
+		expect(
+			node.valueDB.getValue({
+				commandClass: CommandClasses["Manufacturer Specific"],
+				property: "manufacturerId",
+			}),
+		).toBe(0x010f);
+		expect([...driver.controller.nodes.keys()]).toEqual([1, 7, 12]);
+		expect(captured.toString("hex")).toBe(
+			"08410a670c45041a012000fa31070000007205010f06021001",
+		);
+		expect(radio.transmit).not.toHaveBeenCalled();
+		expect(errors).toEqual([]);
+	} finally {
+		await driver.destroy();
+		await rm(directory, { recursive: true, force: true });
 	}
 });
 

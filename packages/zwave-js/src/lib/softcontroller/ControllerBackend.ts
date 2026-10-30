@@ -2100,12 +2100,12 @@ class ControllerBindingRuntime {
 		}
 
 		let status = frame.routedBusy ? 0x01 : 0;
-		// zwave-js 15.x only preserves the Explore bit when the Serial API frame
-		// is also marked TypeBroad. Explorer MPDUs may still carry our node ID as
-		// their logical destination, so normalize that wire-level invariant here.
-		if (frame.isExploreFrame) status |= 0x04 | 0x10;
-		else if (frame.frameType === "broadcast") status |= 0x04;
-		else if (frame.frameType === "multicast") status |= 0x08;
+		// The Serial API permits Explore only with TypeBroad. Preserve logical
+		// addressing so reports addressed to us remain singlecast Command Classes.
+		if (frame.frameType === "broadcast") {
+			status |= 0x04;
+			if (frame.isExploreFrame) status |= 0x10;
+		} else if (frame.frameType === "multicast") status |= 0x08;
 		if (frame.isForeignFrame) status |= 0x40;
 		if (frame.fromForeignHomeId) status |= 0x80;
 
